@@ -1,0 +1,33 @@
+services:
+  gitlab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gitlab-gitlab:latest
+    container_name: gitlab-tfs-mirror
+    restart: unless-stopped
+    hostname: ${GITLAB_HOSTNAME:-gitlab.local}
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url "http://${GITLAB_HOSTNAME:-gitlab.local}:${GITLAB_HTTP_PORT:-8081}"
+
+        prometheus_monitoring['enable'] = false
+        grafana['enable'] = false
+
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2222}
+        gitlab_rails['time_zone'] = '${GITLAB_TIMEZONE:-UTC}'
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD:-ChangeMe123!}'
+        gitlab_rails['api_rate_limit_enabled'] = false
+        gitlab_rails['git_timeout'] = 600
+
+        sidekiq['max_concurrency'] = 10
+    ports:
+      - "${GITLAB_HTTP_PORT:-8081}:${GITLAB_HTTP_PORT:-8081}"
+      - "${GITLAB_SSH_PORT:-2222}:22"
+    shm_size: '256m'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${GITLAB_HTTP_PORT:-8081}/-/readiness"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 300s

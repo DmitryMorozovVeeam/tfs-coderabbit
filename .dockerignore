@@ -1,0 +1,22 @@
+# Repository data (mounted at runtime, not needed during build)
+repos/
+
+# Environment secrets
+.env
+.env.example
+
+# Logs
+logs/
+*.log
+
+# Documentation / tooling not needed in image
+README.md
+gitlab-tfs.ps1
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Git metadata
+.git/
+.gitignore
