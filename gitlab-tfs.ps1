@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # =============================================================================
 # GitLab — Container Management  (cross-platform PowerShell)
-# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Destroy|-Help]
+# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import|-Destroy|-Help]
 #        ./gitlab-tfs.ps1           (no args → interactive menu)
 # =============================================================================
 [CmdletBinding(DefaultParameterSetName = 'Menu')]
@@ -13,6 +13,9 @@ param(
     [Parameter(ParameterSetName = 'Logs',    Mandatory)][switch]$Logs,
     [Parameter(ParameterSetName = 'Status',  Mandatory)][switch]$Status,
     [Parameter(ParameterSetName = 'Backup',  Mandatory)][switch]$Backup,
+    [Parameter(ParameterSetName = 'Export',  Mandatory)][switch]$Export,
+    [Parameter(ParameterSetName = 'Import',  Mandatory)][switch]$Import,
+    [Parameter(ParameterSetName = 'Import',  Mandatory)][string]$File,
     [Parameter(ParameterSetName = 'Destroy', Mandatory)][switch]$Destroy,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
@@ -224,6 +227,59 @@ function Cmd-Destroy {
     }
 }
 
+function Cmd-Export {
+    $imageName = 'gitlab-gitlab:latest'
+    $ts        = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $outFile   = "gitlab-image-$ts.tar.gz"
+
+    # Verify image exists
+    $exists = docker image inspect $imageName 2>$null
+    if (-not $exists) {
+        Write-Host "Image '$imageName' not found — run -Setup or -Start first." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Exporting $imageName to $outFile ..."
+    docker save $imageName | gzip > $outFile
+    $sizeMB = [math]::Round((Get-Item $outFile).Length / 1MB, 1)
+    Write-Host "Done: $outFile ($sizeMB MB)" -ForegroundColor Green
+}
+
+function Cmd-Import {
+    param([string]$FilePath)
+
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        $FilePath = Read-Host 'Path to .tar.gz image file'
+    }
+    if (-not (Test-Path $FilePath)) {
+        Write-Host "File not found: $FilePath" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Importing image from $FilePath ..."
+    if ($FilePath -match '\.gz$') {
+        # Stream-decompress then load
+        if ($IsLinux -or $IsMacOS) {
+            & sh -c "gzip -dc '$FilePath' | docker load"
+        } else {
+            # Windows — use .NET GZipStream to avoid requiring gzip
+            $inStream  = [System.IO.File]::OpenRead($FilePath)
+            $gzStream  = [System.IO.Compression.GZipStream]::new($inStream, [System.IO.Compression.CompressionMode]::Decompress)
+            $proc = Start-Process docker -ArgumentList 'load' -RedirectStandardInput $null -PassThru -NoNewWindow
+            $gzStream.CopyTo($proc.StandardInput.BaseStream)
+            $proc.WaitForExit()
+            $gzStream.Dispose(); $inStream.Dispose()
+        }
+    } else {
+        docker load --input $FilePath
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host 'Image imported successfully.' -ForegroundColor Green
+    } else {
+        Write-Host 'Import failed.' -ForegroundColor Red
+    }
+}
+
 # =============================================================================
 # Interactive menu
 # =============================================================================
@@ -241,7 +297,9 @@ function Show-Menu {
     Write-Host '  5) Logs     - View container logs'
     Write-Host '  6) Status   - Show health'
     Write-Host '  7) Backup   - Backup .env'
-    Write-Host '  8) Destroy  - Remove container'
+    Write-Host '  8) Export   - Save image to .tar.gz'
+    Write-Host '  9) Import   - Load image from .tar.gz'
+    Write-Host ' 10) Destroy  - Remove container'
     Write-Host '  0) Exit'
     Write-Host ''
 }
@@ -249,18 +307,20 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-8]'
+        $choice = Read-Host '  Choose [0-10]'
         Write-Host ''
         switch ($choice) {
-            '1' { Cmd-Setup }
-            '2' { Cmd-Start }
-            '3' { Cmd-Stop }
-            '4' { Cmd-Restart }
-            '5' { Cmd-Logs }
-            '6' { Cmd-Status }
-            '7' { Cmd-Backup }
-            '8' { Cmd-Destroy }
-            '0' { Write-Host 'Bye.'; return }
+            '1'  { Cmd-Setup }
+            '2'  { Cmd-Start }
+            '3'  { Cmd-Stop }
+            '4'  { Cmd-Restart }
+            '5'  { Cmd-Logs }
+            '6'  { Cmd-Status }
+            '7'  { Cmd-Backup }
+            '8'  { Cmd-Export }
+            '9'  { Cmd-Import }
+            '10' { Cmd-Destroy }
+            '0'  { Write-Host 'Bye.'; return }
             default { Write-Host 'Invalid choice.' }
         }
         Write-Host ''
@@ -280,9 +340,11 @@ switch ($PSCmdlet.ParameterSetName) {
     'Logs'    { Cmd-Logs }
     'Status'  { Cmd-Status }
     'Backup'  { Cmd-Backup }
+    'Export'  { Cmd-Export }
+    'Import'  { Cmd-Import -FilePath $File }
     'Destroy' { Cmd-Destroy }
     'Help'    {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Destroy|-Help]'
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-Destroy|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }
