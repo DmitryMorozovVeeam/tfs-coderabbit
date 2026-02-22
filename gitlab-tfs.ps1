@@ -121,7 +121,7 @@ function Cmd-Setup {
     Write-Host ''
 
     Write-Host '[3/3] Building GitLab image...'
-    Invoke-Compose build gitlab
+    Invoke-Compose build --no-cache gitlab
     Write-Host '  Done'
     Write-Host ''
     Write-Host '=== Setup Complete ===' -ForegroundColor Green
@@ -132,7 +132,7 @@ function Cmd-Setup {
 function Cmd-Start {
     Write-Host 'Starting GitLab (isolated container)...'
     Invoke-Compose up --detach --build
-    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8080'
+    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
     $url  = "http://localhost:$port"
     Write-Host ''
     Write-Host "GitLab is starting up (may take 3-5 minutes)."
@@ -140,27 +140,8 @@ function Cmd-Start {
     Write-Host 'Browser will open automatically once GitLab is ready.'
     Write-Host 'Monitor: ./gitlab-tfs.ps1 -Logs'
 
-    # Background job: poll readiness then open browser — does not block the script
-    $browserScript = [scriptblock]::Create(@"
-function Open-BrowserUrl {
-    param([string]`$Url)
-    if (`$IsMacOS) {
-        try { Start-Process 'open' -ArgumentList `$Url -ErrorAction Stop; return `$true } catch {}
-        return `$false
-    }
-    if (-not `$IsLinux) {
-        try { Start-Process `$Url -ErrorAction Stop; return `$true } catch {}
-        return `$false
-    }
-    foreach (`$browser in @('google-chrome','google-chrome-stable','chromium-browser','chromium','firefox','brave-browser','microsoft-edge')) {
-        `$bin = Get-Command `$browser -ErrorAction SilentlyContinue
-        if (`$bin) {
-            try { Start-Process `$bin.Source -ArgumentList `$Url -ErrorAction Stop; return `$true } catch {}
-        }
-    }
-    try { Start-Process 'xdg-open' -ArgumentList `$Url -ErrorAction Stop; return `$true } catch {}
-    return `$false
-}
+    # Detached process: poll readiness then open browser — survives parent script exit
+    $pollScript = @"
 `$readinessUrl = '$url/-/readiness'
 `$deadline     = (Get-Date).AddMinutes(10)
 while ((Get-Date) -lt `$deadline) {
@@ -170,9 +151,37 @@ while ((Get-Date) -lt `$deadline) {
     } catch {}
     Start-Sleep -Seconds 10
 }
-Open-BrowserUrl -Url '$url' | Out-Null
-"@)
-    Start-Job -ScriptBlock $browserScript | Out-Null
+if (`$IsMacOS) {
+    Start-Process 'open' -ArgumentList '$url'
+} elseif (-not `$IsLinux) {
+    Start-Process '$url'
+} else {
+    `$opened = `$false
+    foreach (`$b in @('google-chrome','google-chrome-stable','chromium-browser','chromium','firefox','brave-browser','microsoft-edge')) {
+        `$bin = Get-Command `$b -ErrorAction SilentlyContinue
+        if (`$bin) { Start-Process `$bin.Source -ArgumentList '$url'; `$opened = `$true; break }
+    }
+    if (-not `$opened) { Start-Process 'xdg-open' -ArgumentList '$url' }
+}
+"@
+    # Launch as a fully detached process so it survives this script exiting
+    $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($pollScript))
+    if ($IsLinux -or $IsMacOS) {
+        # Use nohup + sh to fully detach from parent process
+        # Pass DISPLAY/WAYLAND_DISPLAY so the child can open a browser
+        $pwshBin = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+        if (-not $pwshBin) { $pwshBin = 'pwsh' }
+        $envPrefix = ''
+        $disp = $env:DISPLAY
+        $wdisp = $env:WAYLAND_DISPLAY
+        if ($disp)  { $envPrefix += "DISPLAY=$disp " }
+        if ($wdisp) { $envPrefix += "WAYLAND_DISPLAY=$wdisp " }
+        & sh -c "nohup env $envPrefix $pwshBin -NoProfile -NonInteractive -EncodedCommand $encodedCmd </dev/null >/dev/null 2>&1 &"
+    } else {
+        $pwshBin = (Get-Process -Id $PID).Path
+        if (-not $pwshBin) { $pwshBin = 'pwsh' }
+        Start-Process -FilePath $pwshBin -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCmd -WindowStyle Hidden
+    }
 }
 
 function Cmd-Stop {
@@ -194,7 +203,7 @@ function Cmd-Status {
     Write-Host '=== GitLab Status ===' -ForegroundColor Cyan
     Invoke-Compose ps
     Write-Host ''
-    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8080'
+    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
     try {
         $null = Invoke-WebRequest -Uri "http://localhost:$port/-/readiness" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
         Write-Host 'GitLab: HEALTHY' -ForegroundColor Green
@@ -309,19 +318,26 @@ function Start-InteractiveMenu {
         Show-Menu
         $choice = Read-Host '  Choose [0-10]'
         Write-Host ''
-        switch ($choice) {
-            '1'  { Cmd-Setup }
-            '2'  { Cmd-Start }
-            '3'  { Cmd-Stop }
-            '4'  { Cmd-Restart }
-            '5'  { Cmd-Logs }
-            '6'  { Cmd-Status }
-            '7'  { Cmd-Backup }
-            '8'  { Cmd-Export }
-            '9'  { Cmd-Import }
-            '10' { Cmd-Destroy }
-            '0'  { Write-Host 'Bye.'; return }
-            default { Write-Host 'Invalid choice.' }
+        if ($choice -eq '0') {
+            Write-Host 'Bye.'
+            exit 0
+        }
+        try {
+            switch ($choice) {
+                '1'  { Cmd-Setup }
+                '2'  { Cmd-Start }
+                '3'  { Cmd-Stop }
+                '4'  { Cmd-Restart }
+                '5'  { Cmd-Logs }
+                '6'  { Cmd-Status }
+                '7'  { Cmd-Backup }
+                '8'  { Cmd-Export }
+                '9'  { Cmd-Import }
+                '10' { Cmd-Destroy }
+                default { Write-Host 'Invalid choice.' }
+            }
+        } catch {
+            Write-Host "Error: $_" -ForegroundColor Red
         }
         Write-Host ''
         Read-Host 'Press Enter to continue...'
