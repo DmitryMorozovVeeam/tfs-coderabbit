@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # =============================================================================
 # GitLab — Container Management  (cross-platform PowerShell)
-# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import|-CodeRabbit|-Destroy|-Help]
+# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import|-CodeRabbit|-Tunnel|-Destroy|-Help]
 #        ./gitlab-tfs.ps1           (no args → interactive menu)
 # =============================================================================
 [CmdletBinding(DefaultParameterSetName = 'Menu')]
@@ -17,6 +17,7 @@ param(
     [Parameter(ParameterSetName = 'Import',     Mandatory)][switch]$Import,
     [Parameter(ParameterSetName = 'Import',     Mandatory)][string]$File,
     [Parameter(ParameterSetName = 'CodeRabbit', Mandatory)][switch]$CodeRabbit,
+    [Parameter(ParameterSetName = 'Tunnel',     Mandatory)][switch]$Tunnel,
     [Parameter(ParameterSetName = 'Destroy',    Mandatory)][switch]$Destroy,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
@@ -347,12 +348,108 @@ function Cmd-CodeRabbit {
     Write-Host ''
     Write-Host '  CodeRabbit will auto-configure webhooks once connected.'
     Write-Host ''
-    Write-Host '  NOTE: If this GitLab is not publicly accessible,' -ForegroundColor Yellow
-    Write-Host '  expose it via a tunnel first:' -ForegroundColor Yellow
-    Write-Host "    ngrok http $port"
-    Write-Host '  Then use the ngrok URL as the GitLab URL.'
+    Write-Host '  NOTE: This GitLab is not publicly accessible.' -ForegroundColor Yellow
+    Write-Host '  Start the Cloudflare tunnel first:' -ForegroundColor Yellow
+    Write-Host '    ./gitlab-tfs.ps1 -Tunnel'
+    Write-Host '  Then use the tunnel URL as the GitLab URL.'
     Write-Host ''
     Write-Host '  Copy .coderabbit.yaml to each repo root to customize reviews.' -ForegroundColor Green
+    Write-Host ''
+}
+
+function Cmd-Tunnel {
+    Write-Host ''
+    Write-Host '=== Cloudflare Tunnel ===' -ForegroundColor Cyan
+    Write-Host ''
+
+    # Check if tunnel is already running
+    $running = docker ps --filter 'name=gitlab-tunnel' --format '{{.Status}}' 2>$null
+    if (-not $running) {
+        Write-Host '[1/3] Starting tunnel (cloudflared)...'
+        if ($script:ComposeCmd -eq 'docker compose') {
+            & docker compose --profile tunnel up --detach tunnel
+        } else {
+            & docker-compose --profile tunnel up --detach tunnel
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  Failed to start tunnel.' -ForegroundColor Red
+            return
+        }
+        Write-Host '  Waiting for tunnel to establish...'
+        Start-Sleep -Seconds 10
+    } else {
+        Write-Host '[1/3] Tunnel container is already running.' -ForegroundColor Green
+    }
+
+    # Parse tunnel URL from cloudflared logs
+    Write-Host '[2/3] Fetching tunnel URL...'
+    $logs = if ($script:ComposeCmd -eq 'docker compose') {
+        (docker compose --profile tunnel logs tunnel 2>&1) -join "`n"
+    } else {
+        (docker-compose --profile tunnel logs tunnel 2>&1) -join "`n"
+    }
+
+    $tunnelUrl = $null
+    if ($logs -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+        $tunnelUrl = $matches[1]
+    }
+
+    if (-not $tunnelUrl) {
+        Write-Host '  Could not detect tunnel URL yet — retrying in 10 s...' -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
+        $logs = if ($script:ComposeCmd -eq 'docker compose') {
+            (docker compose --profile tunnel logs tunnel 2>&1) -join "`n"
+        } else {
+            (docker-compose --profile tunnel logs tunnel 2>&1) -join "`n"
+        }
+        if ($logs -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+            $tunnelUrl = $matches[1]
+        }
+    }
+
+    if (-not $tunnelUrl) {
+        Write-Host '  Could not detect tunnel URL. Recent logs:' -ForegroundColor Red
+        $logs -split "`n" | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        return
+    }
+    Write-Host "  Tunnel URL: $tunnelUrl" -ForegroundColor Green
+    Write-Host ''
+
+    # Test connectivity through the tunnel (any HTTP response = tunnel works)
+    Write-Host '[3/3] Testing tunnel connectivity...'
+    $testOk = $false
+    try {
+        # Use curl to avoid PowerShell's redirect policy issues (HTTPS→HTTP)
+        $curlOutput = (curl -s -o /dev/null -w '%{http_code}' -m 15 -L "$tunnelUrl/" 2>&1)
+        if ($curlOutput -match '(\d{3})') {
+            $code = [int]$matches[1]
+            if ($code -gt 0) {
+                Write-Host "  Tunnel is WORKING (HTTP $code)" -ForegroundColor Green
+                $testOk = $true
+            }
+        }
+    } catch {}
+    if (-not $testOk) {
+        # Fallback: try PowerShell with MaximumRedirection 0 to just check initial response
+        try {
+            $resp = Invoke-WebRequest -Uri "$tunnelUrl/" -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -SkipHttpErrorCheck -ErrorAction Stop
+            Write-Host "  Tunnel is WORKING (HTTP $($resp.StatusCode))" -ForegroundColor Green
+        } catch {
+            if ($_.Exception.Response) {
+                Write-Host '  Tunnel is WORKING (redirect received)' -ForegroundColor Green
+            } else {
+                Write-Host '  Tunnel test FAILED — no response from tunnel URL.' -ForegroundColor Yellow
+                Write-Host "  Error: $_" -ForegroundColor DarkGray
+            }
+        }
+    }
+    Write-Host ''
+    Write-Host '  Use this URL in CodeRabbit setup:' -ForegroundColor Cyan
+    Write-Host "  $tunnelUrl" -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  NOTE: URL changes each time the tunnel restarts.' -ForegroundColor DarkGray
+    Write-Host '  For a permanent URL, configure a named Cloudflare Tunnel' -ForegroundColor DarkGray
+    Write-Host '  with a custom domain (requires a free Cloudflare account).' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -376,7 +473,8 @@ function Show-Menu {
     Write-Host '  8) Export     - Save image to .tar.gz'
     Write-Host '  9) Import     - Load image from .tar.gz'
     Write-Host ' 10) CodeRabbit - Setup AI code review'
-    Write-Host ' 11) Destroy    - Remove container'
+    Write-Host ' 11) Tunnel     - Start & test Cloudflare tunnel'
+    Write-Host ' 12) Destroy    - Remove container'
     Write-Host '  0) Exit'
     Write-Host ''
 }
@@ -384,7 +482,7 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-11]'
+        $choice = Read-Host '  Choose [0-12]'
         Write-Host ''
         if ($choice -eq '0') {
             Write-Host 'Bye.'
@@ -402,7 +500,8 @@ function Start-InteractiveMenu {
                 '8'  { Cmd-Export }
                 '9'  { Cmd-Import }
                 '10' { Cmd-CodeRabbit }
-                '11' { Cmd-Destroy }
+                '11' { Cmd-Tunnel }
+                '12' { Cmd-Destroy }
                 default { Write-Host 'Invalid choice.' }
             }
         } catch {
@@ -428,9 +527,10 @@ switch ($PSCmdlet.ParameterSetName) {
     'Export'     { Cmd-Export }
     'Import'     { Cmd-Import -FilePath $File }
     'CodeRabbit' { Cmd-CodeRabbit }
+    'Tunnel'     { Cmd-Tunnel }
     'Destroy'    { Cmd-Destroy }
     'Help'       {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Destroy|-Help]'
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }

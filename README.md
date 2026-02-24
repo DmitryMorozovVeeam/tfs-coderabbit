@@ -5,21 +5,24 @@ Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
 ## Architecture
 
 ```
-┌──────────────────────────────────┐
-│  Host                            │
-│  ┌────────────────────────────┐  │
-│  │  gitlab-tfs-mirror         │  │
-│  │  GitLab CE · port 8081     │  │
-│  │  Image: gitlab-gitlab      │  │
-│  └─────────────┬──────────────┘  │
-│                │ webhooks        │
-└────────────────┼─────────────────┘
-                 │
-                 ▼
-        ┌────────────────┐
-        │ CodeRabbit.ai  │
-        │ (AI PR review) │
-        └────────────────┘
+┌──────────────────────────────────────┐
+│  Host                                │
+│  ┌────────────────────────────────┐  │
+│  │  gitlab-tfs-mirror             │  │
+│  │  GitLab CE · port 8081         │  │
+│  └───────────────┬────────────────┘  │
+│                  │                   │
+│  ┌───────────────┴────────────────┐  │
+│  │  gitlab-tunnel (cloudflared)   │  │
+│  │  outbound tunnel → Cloudflare  │  │
+│  └───────────────┬────────────────┘  │
+└──────────────────┼───────────────────┘
+                   │ https://*.trycloudflare.com
+                   ▼
+          ┌────────────────┐
+          │ CodeRabbit.ai  │
+          │ (AI PR review) │
+          └────────────────┘
 ```
 
 **Storage:** three named Docker volumes (`gitlab_config`, `gitlab_logs`, `gitlab_data`).
@@ -58,6 +61,7 @@ Run with no arguments for an interactive menu, or pass a flag directly:
 | `-Export` | Save Docker image to `.tar.gz` |
 | `-Import -File <path>` | Load Docker image from `.tar.gz` |
 | `-CodeRabbit` | Set up CodeRabbit AI code review |
+| `-Tunnel` | Start Cloudflare tunnel & test connectivity |
 | `-Destroy` | Remove container + image (confirms first) |
 | `-Help` | Show usage |
 
@@ -80,14 +84,30 @@ docker exec gitlab-tfs-mirror gitlab-backup create
 docker cp gitlab-tfs-mirror:/var/opt/gitlab/backups/ ./backups/
 ```
 
+## Cloudflare Tunnel
+
+The machine running GitLab is not directly accessible from the internet.
+A **Cloudflare Tunnel** (`cloudflared`) runs as a sidecar container and creates
+an outbound-only connection to Cloudflare's edge, giving you a public
+`https://*.trycloudflare.com` URL — no inbound ports, no account needed.
+
+```powershell
+./gitlab-tfs.ps1 -Tunnel       # start tunnel, show URL, test connectivity
+```
+
+The tunnel service starts on demand (Docker Compose profile `tunnel`) and
+does **not** launch with `-Start`. The URL changes on each restart; for a
+permanent URL, configure a named Cloudflare Tunnel with a custom domain.
+
 ## CodeRabbit (AI Code Review)
 
 ```powershell
-./gitlab-tfs.ps1 -CodeRabbit
+./gitlab-tfs.ps1 -Tunnel       # get the public URL first
+./gitlab-tfs.ps1 -CodeRabbit   # create PAT + show setup steps
 ```
 
 Creates a Personal Access Token and prints setup steps for [app.coderabbit.ai](https://app.coderabbit.ai).
-If GitLab is not publicly reachable, expose it first with `ngrok http 8081`.
+Use the tunnel URL (from `-Tunnel`) as the GitLab URL in CodeRabbit.
 Copy `.coderabbit.yaml` to each repo root to customise review behaviour.
 
 ## Troubleshooting
