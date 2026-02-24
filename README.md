@@ -1,221 +1,108 @@
 # GitLab Container Manager
 
-A Dockerized GitLab CE instance managed via a cross-platform PowerShell script.
-GitLab runs in a single isolated container; all internal state lives inside it —
-destroying the container resets GitLab completely.
+Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────┐
-│  Host Machine                        │
-│                                      │
-│  ┌────────────────────────────────┐  │
-│  │  gitlab-tfs-mirror (container) │  │
-│  │                                │  │
-│  │  GitLab CE  (port 8081)        │  │
-│  │  Image: gitlab-gitlab:latest   │  │
-│  └──────────┬─────────────────────┘  │
-│             │ webhooks                │
-└─────────────┼────────────────────────┘
-              │
-              ▼
-    ┌──────────────────┐
-    │  CodeRabbit.ai   │
-    │ (AI Code Review) │
-    └──────────────────┘
+┌──────────────────────────────────┐
+│  Host                            │
+│  ┌────────────────────────────┐  │
+│  │  gitlab-tfs-mirror         │  │
+│  │  GitLab CE · port 8081     │  │
+│  │  Image: gitlab-gitlab      │  │
+│  └─────────────┬──────────────┘  │
+│                │ webhooks        │
+└────────────────┼─────────────────┘
+                 │
+                 ▼
+        ┌────────────────┐
+        │ CodeRabbit.ai  │
+        │ (AI PR review) │
+        └────────────────┘
 ```
 
-**Isolation model:**
-- No named Docker volumes — container is fully disposable
-- No host bind-mounts — all GitLab state lives inside the container
+**Storage:** three named Docker volumes (`gitlab_config`, `gitlab_logs`, `gitlab_data`).
+Data survives container restarts; `-Destroy` removes the container and image but **not** volumes.
+To wipe everything: `docker compose down -v --rmi local`.
 
 ## Prerequisites
 
-- Docker Engine 20.10+ with Docker Compose v2
+- Docker Engine 20.10+ with Compose v2
 - Git
-- **PowerShell 7+** — pre-installed on Windows; on Linux/macOS:
-  ```bash
-  snap install powershell   # Linux
-  brew install powershell   # macOS
-  ```
+- PowerShell 7+ (`snap install powershell` / `brew install powershell`)
 
 ## Quick Start
 
-### 1. First-time setup
-
 ```powershell
-./gitlab-tfs.ps1 -Setup
+./gitlab-tfs.ps1 -Setup        # check prereqs, create .env, build image
+# edit .env — set GITLAB_ROOT_PASSWORD at minimum
+./gitlab-tfs.ps1 -Start        # start container, auto-opens browser when ready
 ```
 
-Checks prerequisites, creates `.env` from `.env.example`, and builds the image.
+Login: `http://localhost:8081` · user `root` · password from `.env`
 
-### 2. Configure environment
+## Commands
 
-Edit `.env` — at minimum set:
+Run with no arguments for an interactive menu, or pass a flag directly:
 
-```bash
-GITLAB_ROOT_PASSWORD=YourSecurePassword123!
-GITLAB_HTTP_PORT=8081        # change if 8081 is already in use
-```
-
-### 3. Start
-
-```powershell
-./gitlab-tfs.ps1 -Start
-```
-
-The script returns immediately. GitLab takes **3–5 minutes** to fully initialize.
-Your default browser opens automatically once GitLab is ready.
-
-### 4. Log in
-
-- URL: `http://localhost:8081`
-- Username: `root`
-- Password: value of `GITLAB_ROOT_PASSWORD` in `.env`
-
-## Management Script
-
-`gitlab-tfs.ps1` works on Windows, macOS, and Linux.
-Run with **no arguments** for an interactive menu, or use a named parameter directly:
-
-```powershell
-./gitlab-tfs.ps1              # interactive menu
-
-./gitlab-tfs.ps1 -Setup       # check prereqs, create .env, build image
-./gitlab-tfs.ps1 -Start       # start container (detached), open browser when ready
-./gitlab-tfs.ps1 -Stop        # stop and remove container
-./gitlab-tfs.ps1 -Restart     # restart running container
-./gitlab-tfs.ps1 -Logs        # stream container logs (Ctrl+C to exit)
-./gitlab-tfs.ps1 -Status      # show container state and health
-./gitlab-tfs.ps1 -Backup      # save .env to backups/<timestamp>/
-./gitlab-tfs.ps1 -Export      # save Docker image to .tar.gz
-./gitlab-tfs.ps1 -Import -File <path>  # load Docker image from .tar.gz
-./gitlab-tfs.ps1 -CodeRabbit  # setup CodeRabbit AI code review integration
-./gitlab-tfs.ps1 -Destroy     # remove container + image (prompts for confirmation)
-./gitlab-tfs.ps1 -Help        # show usage
-```
-
-Tab-completion works for all parameters in PowerShell.
-
-### Interactive menu
-
-```
-+==============================+
-|   GitLab Container Manager   |
-+==============================+
-
-  1) Setup      - First-time build
-  2) Start      - Start container
-  3) Stop       - Stop container
-  4) Restart    - Restart container
-  5) Logs       - View container logs
-  6) Status     - Show health
-  7) Backup     - Backup .env
-  8) Export     - Save image to .tar.gz
-  9) Import     - Load image from .tar.gz
- 10) CodeRabbit - Setup AI code review
- 11) Destroy    - Remove container
-  0) Exit
-```
+| Flag | Description |
+|------|-------------|
+| `-Setup` | Check prereqs, create `.env`, build image |
+| `-Start` | Start container (detached), open browser when ready |
+| `-Stop` | Stop and remove container |
+| `-Restart` | Restart container |
+| `-Logs` | Stream container logs |
+| `-Status` | Show container state and health |
+| `-Backup` | Save `.env` to `backups/<timestamp>/` |
+| `-Export` | Save Docker image to `.tar.gz` |
+| `-Import -File <path>` | Load Docker image from `.tar.gz` |
+| `-CodeRabbit` | Set up CodeRabbit AI code review |
+| `-Destroy` | Remove container + image (confirms first) |
+| `-Help` | Show usage |
 
 ## Environment Variables (`.env`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GITLAB_HTTP_PORT` | `8081` | Host port GitLab is published on |
-| `GITLAB_SSH_PORT` | `2222` | Host port for Git-over-SSH |
+| `GITLAB_HTTP_PORT` | `8081` | Host HTTP port |
+| `GITLAB_SSH_PORT` | `2222` | Host SSH port |
 | `GITLAB_ROOT_PASSWORD` | `ChangeMe123!` | Initial root password |
-| `GITLAB_HOSTNAME` | `gitlab.local` | Hostname used in `external_url` |
-| `GITLAB_TIMEZONE` | `UTC` | GitLab time zone |
+| `GITLAB_HOSTNAME` | `gitlab.local` | Hostname in `external_url` |
+| `GITLAB_TIMEZONE` | `UTC` | Time zone |
 
 ## Backup & Restore
 
-`-Backup` saves only `.env` to `backups/<timestamp>/`.
-GitLab's internal data (database, uploaded files, repositories) lives inside the
-container. For a full GitLab backup use the built-in tool:
+`-Backup` saves `.env` only. For a full GitLab backup:
 
 ```bash
 docker exec gitlab-tfs-mirror gitlab-backup create
+docker cp gitlab-tfs-mirror:/var/opt/gitlab/backups/ ./backups/
 ```
 
-Backups are written inside the container at `/var/opt/gitlab/backups/`.
-Copy them out with `docker cp` before running `-Destroy`.
-
-## CodeRabbit Integration (AI Code Review)
-
-[CodeRabbit](https://coderabbit.ai) provides automated AI-powered code reviews
-on every merge request.
-
-### Quick setup
+## CodeRabbit (AI Code Review)
 
 ```powershell
 ./gitlab-tfs.ps1 -CodeRabbit
 ```
 
-This command:
-
-1. Verifies GitLab is running and healthy
-2. Creates a Personal Access Token (`api` scope, 1-year expiry) via the Rails console
-3. Displays the token and step-by-step instructions for CodeRabbit
-
-### Manual setup
-
-1. **Create a Personal Access Token** in GitLab:
-   Admin → Settings → Access Tokens → add a token with `api` scope
-2. **Register at CodeRabbit**:
-   Go to [app.coderabbit.ai](https://app.coderabbit.ai), choose
-   *Self-Managed GitLab*, and enter your GitLab URL + access token.
-3. **Add `.coderabbit.yaml`** to repository roots to customize review behavior.
-   A template is included in this project.
-
-### Network access
-
-CodeRabbit SaaS needs to reach your GitLab instance over the internet.
-If GitLab is not publicly accessible, expose it with a tunnel:
-
-```bash
-ngrok http 8081
-```
-
-Then provide the ngrok URL to CodeRabbit instead of `http://localhost:8081`.
+Creates a Personal Access Token and prints setup steps for [app.coderabbit.ai](https://app.coderabbit.ai).
+If GitLab is not publicly reachable, expose it first with `ngrok http 8081`.
+Copy `.coderabbit.yaml` to each repo root to customise review behaviour.
 
 ## Troubleshooting
 
-### Port already in use
+| Symptom | Fix |
+|---------|-----|
+| Port already in use | Change `GITLAB_HTTP_PORT` in `.env` |
+| Not ready after 5 min | Check `-Logs`; GitLab needs ≥ 4 GB RAM |
+| Browser doesn't open | Open `http://localhost:<port>` manually |
 
-```
-Bind for 0.0.0.0:8081 failed: port is already allocated
-```
+## Requirements
 
-Change `GITLAB_HTTP_PORT` in `.env` to a free port, then run `-Start` again.
+4 GB RAM minimum (8 GB recommended), 2+ CPU cores, 10 GB disk.
 
-### GitLab not ready after 5 minutes
+## Security
 
-```powershell
-./gitlab-tfs.ps1 -Logs          # look for errors
-```
-
-```bash
-docker stats gitlab-tfs-mirror  # check memory — GitLab needs at least 4 GB RAM
-```
-
-### Browser doesn't open
-
-The script tries browser binaries directly (`firefox`, `google-chrome`, `chromium`, etc.)
-before falling back to `xdg-open`. If none are found, open the URL manually:
-`http://localhost:<GITLAB_HTTP_PORT>`.
-
-## Resource Requirements
-
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| CPU      | 2 cores | 4 cores     |
-| RAM      | 4 GB    | 8 GB        |
-| Disk     | 10 GB   | 50 GB+      |
-
-## Security Notes
-
-- `.env` contains your root password — never commit it to version control
-- Container is fully isolated — `-Destroy` removes all internal GitLab state
+- `.env` holds the root password — **never commit it**
 - Rotate the root password after first login
