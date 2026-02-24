@@ -1,0 +1,28 @@
+# =============================================================================
+# CodeRabbit — AI Code Review Configuration
+# Documentation: https://docs.coderabbit.ai/guides/configure-coderabbit
+# Place this file in the root of each GitLab repository.
+# =============================================================================
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  changed_files_summary: true
+  path_filters: []
+  path_instructions: []
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches: []
+
+chat:
+  auto_reply: true

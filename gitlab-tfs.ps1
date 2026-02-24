@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # =============================================================================
 # GitLab — Container Management  (cross-platform PowerShell)
-# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import|-Destroy|-Help]
+# Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import|-CodeRabbit|-Destroy|-Help]
 #        ./gitlab-tfs.ps1           (no args → interactive menu)
 # =============================================================================
 [CmdletBinding(DefaultParameterSetName = 'Menu')]
@@ -13,10 +13,11 @@ param(
     [Parameter(ParameterSetName = 'Logs',    Mandatory)][switch]$Logs,
     [Parameter(ParameterSetName = 'Status',  Mandatory)][switch]$Status,
     [Parameter(ParameterSetName = 'Backup',  Mandatory)][switch]$Backup,
-    [Parameter(ParameterSetName = 'Export',  Mandatory)][switch]$Export,
-    [Parameter(ParameterSetName = 'Import',  Mandatory)][switch]$Import,
-    [Parameter(ParameterSetName = 'Import',  Mandatory)][string]$File,
-    [Parameter(ParameterSetName = 'Destroy', Mandatory)][switch]$Destroy,
+    [Parameter(ParameterSetName = 'Export',     Mandatory)][switch]$Export,
+    [Parameter(ParameterSetName = 'Import',     Mandatory)][switch]$Import,
+    [Parameter(ParameterSetName = 'Import',     Mandatory)][string]$File,
+    [Parameter(ParameterSetName = 'CodeRabbit', Mandatory)][switch]$CodeRabbit,
+    [Parameter(ParameterSetName = 'Destroy',    Mandatory)][switch]$Destroy,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
 $ErrorActionPreference = 'Stop'
@@ -289,6 +290,72 @@ function Cmd-Import {
     }
 }
 
+function Cmd-CodeRabbit {
+    Write-Host ''
+    Write-Host '=== CodeRabbit AI Review Setup ===' -ForegroundColor Cyan
+    Write-Host ''
+
+    # 1. Check GitLab health
+    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
+    $baseUrl = "http://localhost:$port"
+    Write-Host '[1/3] Checking GitLab readiness...'
+    try {
+        $null = Invoke-WebRequest -Uri "$baseUrl/-/readiness" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        Write-Host '  GitLab is HEALTHY' -ForegroundColor Green
+    } catch {
+        Write-Host '  GitLab is NOT READY — start it first with -Start' -ForegroundColor Red
+        return
+    }
+    Write-Host ''
+
+    # 2. Create Personal Access Token via Rails console
+    Write-Host '[2/3] Creating Personal Access Token (api scope)...'
+    Write-Host '  This may take 30-60 s (Rails console startup)...' -ForegroundColor DarkGray
+    $tokenName = "coderabbit-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $rubyCode = "u=User.find_by_username('root');" +
+                "t=u.personal_access_tokens.create!(name:'$tokenName'," +
+                "scopes:['api','read_user','read_repository']," +
+                "expires_at:365.days.from_now);" +
+                "puts('TOKEN:'+t.token)"
+
+    $rawOutput = (docker exec gitlab-tfs-mirror gitlab-rails runner $rubyCode 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  Failed to create token:' -ForegroundColor Red
+        Write-Host "  $rawOutput" -ForegroundColor Red
+        return
+    }
+
+    if ($rawOutput -match 'TOKEN:([A-Za-z0-9_-]+)') {
+        $pat = $matches[1]
+    } else {
+        Write-Host '  Could not parse token from Rails output.' -ForegroundColor Red
+        Write-Host "  Output: $rawOutput" -ForegroundColor DarkGray
+        return
+    }
+    Write-Host "  Token created: $tokenName" -ForegroundColor Green
+    Write-Host ''
+
+    # 3. Display setup instructions
+    Write-Host '[3/3] Complete setup at CodeRabbit:' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  1. Open  https://app.coderabbit.ai  and sign up / log in'
+    Write-Host '  2. Choose "Add Self-Managed GitLab"'
+    Write-Host '  3. Enter the values below:'
+    Write-Host ''
+    Write-Host "     GitLab URL:    $baseUrl" -ForegroundColor White
+    Write-Host "     Access Token:  $pat" -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  CodeRabbit will auto-configure webhooks once connected.'
+    Write-Host ''
+    Write-Host '  NOTE: If this GitLab is not publicly accessible,' -ForegroundColor Yellow
+    Write-Host '  expose it via a tunnel first:' -ForegroundColor Yellow
+    Write-Host "    ngrok http $port"
+    Write-Host '  Then use the ngrok URL as the GitLab URL.'
+    Write-Host ''
+    Write-Host '  Copy .coderabbit.yaml to each repo root to customize reviews.' -ForegroundColor Green
+    Write-Host ''
+}
+
 # =============================================================================
 # Interactive menu
 # =============================================================================
@@ -306,9 +373,10 @@ function Show-Menu {
     Write-Host '  5) Logs     - View container logs'
     Write-Host '  6) Status   - Show health'
     Write-Host '  7) Backup   - Backup .env'
-    Write-Host '  8) Export   - Save image to .tar.gz'
-    Write-Host '  9) Import   - Load image from .tar.gz'
-    Write-Host ' 10) Destroy  - Remove container'
+    Write-Host '  8) Export     - Save image to .tar.gz'
+    Write-Host '  9) Import     - Load image from .tar.gz'
+    Write-Host ' 10) CodeRabbit - Setup AI code review'
+    Write-Host ' 11) Destroy    - Remove container'
     Write-Host '  0) Exit'
     Write-Host ''
 }
@@ -316,7 +384,7 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-10]'
+        $choice = Read-Host '  Choose [0-11]'
         Write-Host ''
         if ($choice -eq '0') {
             Write-Host 'Bye.'
@@ -333,7 +401,8 @@ function Start-InteractiveMenu {
                 '7'  { Cmd-Backup }
                 '8'  { Cmd-Export }
                 '9'  { Cmd-Import }
-                '10' { Cmd-Destroy }
+                '10' { Cmd-CodeRabbit }
+                '11' { Cmd-Destroy }
                 default { Write-Host 'Invalid choice.' }
             }
         } catch {
@@ -356,11 +425,12 @@ switch ($PSCmdlet.ParameterSetName) {
     'Logs'    { Cmd-Logs }
     'Status'  { Cmd-Status }
     'Backup'  { Cmd-Backup }
-    'Export'  { Cmd-Export }
-    'Import'  { Cmd-Import -FilePath $File }
-    'Destroy' { Cmd-Destroy }
-    'Help'    {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-Destroy|-Help]'
+    'Export'     { Cmd-Export }
+    'Import'     { Cmd-Import -FilePath $File }
+    'CodeRabbit' { Cmd-CodeRabbit }
+    'Destroy'    { Cmd-Destroy }
+    'Help'       {
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Destroy|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }

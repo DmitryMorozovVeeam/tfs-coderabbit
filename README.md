@@ -15,8 +15,15 @@ destroying the container resets GitLab completely.
 │  │                                │  │
 │  │  GitLab CE  (port 8081)        │  │
 │  │  Image: gitlab-gitlab:latest   │  │
-│  └────────────────────────────────┘  │
-└──────────────────────────────────────┘
+│  └──────────┬─────────────────────┘  │
+│             │ webhooks                │
+└─────────────┼────────────────────────┘
+              │
+              ▼
+    ┌──────────────────┐
+    │  CodeRabbit.ai   │
+    │ (AI Code Review) │
+    └──────────────────┘
 ```
 
 **Isolation model:**
@@ -82,6 +89,9 @@ Run with **no arguments** for an interactive menu, or use a named parameter dire
 ./gitlab-tfs.ps1 -Logs        # stream container logs (Ctrl+C to exit)
 ./gitlab-tfs.ps1 -Status      # show container state and health
 ./gitlab-tfs.ps1 -Backup      # save .env to backups/<timestamp>/
+./gitlab-tfs.ps1 -Export      # save Docker image to .tar.gz
+./gitlab-tfs.ps1 -Import -File <path>  # load Docker image from .tar.gz
+./gitlab-tfs.ps1 -CodeRabbit  # setup CodeRabbit AI code review integration
 ./gitlab-tfs.ps1 -Destroy     # remove container + image (prompts for confirmation)
 ./gitlab-tfs.ps1 -Help        # show usage
 ```
@@ -95,14 +105,17 @@ Tab-completion works for all parameters in PowerShell.
 |   GitLab Container Manager   |
 +==============================+
 
-  1) Setup    - First-time build
-  2) Start    - Start container
-  3) Stop     - Stop container
-  4) Restart  - Restart container
-  5) Logs     - View container logs
-  6) Status   - Show health
-  7) Backup   - Backup .env
-  8) Destroy  - Remove container
+  1) Setup      - First-time build
+  2) Start      - Start container
+  3) Stop       - Stop container
+  4) Restart    - Restart container
+  5) Logs       - View container logs
+  6) Status     - Show health
+  7) Backup     - Backup .env
+  8) Export     - Save image to .tar.gz
+  9) Import     - Load image from .tar.gz
+ 10) CodeRabbit - Setup AI code review
+ 11) Destroy    - Remove container
   0) Exit
 ```
 
@@ -128,6 +141,44 @@ docker exec gitlab-tfs-mirror gitlab-backup create
 
 Backups are written inside the container at `/var/opt/gitlab/backups/`.
 Copy them out with `docker cp` before running `-Destroy`.
+
+## CodeRabbit Integration (AI Code Review)
+
+[CodeRabbit](https://coderabbit.ai) provides automated AI-powered code reviews
+on every merge request.
+
+### Quick setup
+
+```powershell
+./gitlab-tfs.ps1 -CodeRabbit
+```
+
+This command:
+
+1. Verifies GitLab is running and healthy
+2. Creates a Personal Access Token (`api` scope, 1-year expiry) via the Rails console
+3. Displays the token and step-by-step instructions for CodeRabbit
+
+### Manual setup
+
+1. **Create a Personal Access Token** in GitLab:
+   Admin → Settings → Access Tokens → add a token with `api` scope
+2. **Register at CodeRabbit**:
+   Go to [app.coderabbit.ai](https://app.coderabbit.ai), choose
+   *Self-Managed GitLab*, and enter your GitLab URL + access token.
+3. **Add `.coderabbit.yaml`** to repository roots to customize review behavior.
+   A template is included in this project.
+
+### Network access
+
+CodeRabbit SaaS needs to reach your GitLab instance over the internet.
+If GitLab is not publicly accessible, expose it with a tunnel:
+
+```bash
+ngrok http 8081
+```
+
+Then provide the ngrok URL to CodeRabbit instead of `http://localhost:8081`.
 
 ## Troubleshooting
 
