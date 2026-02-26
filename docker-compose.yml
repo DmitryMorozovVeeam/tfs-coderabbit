@@ -34,7 +34,8 @@ services:
       - gitlab_data:/var/opt/gitlab
     shm_size: '256m'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${GITLAB_HTTP_PORT:-8081}/-/readiness"]
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "-w", "%{http_code}",
+             "http://localhost:${GITLAB_HTTP_PORT:-8081}/"]
       interval: 60s
       timeout: 30s
       retries: 5
@@ -51,7 +52,32 @@ services:
     profiles:
       - tunnel
 
+  sync:
+    build:
+      context: ./sync
+      dockerfile: Dockerfile
+    image: gitlab-tfs-sync:latest
+    container_name: gitlab-tfs-sync
+    restart: unless-stopped
+    environment:
+      TFS_URL:            ${TFS_URL:-}
+      TFS_PROJECT:        ${TFS_PROJECT:-}
+      TFS_PAT:            ${TFS_PAT:-}
+      TFS_REPOS:          ${TFS_REPOS:-}
+      GITLAB_URL:         http://gitlab:${GITLAB_HTTP_PORT:-8081}
+      GITLAB_TOKEN:       ${GITLAB_TFS_TOKEN:-}
+      GITLAB_NAMESPACE:   ${GITLAB_TFS_NAMESPACE:-tfs-mirrors}
+      SYNC_INTERVAL:      ${TFS_SYNC_INTERVAL:-60}
+    volumes:
+      - tfs_repos:/repos
+    depends_on:
+      gitlab:
+        condition: service_healthy
+    profiles:
+      - tfs
+
 volumes:
   gitlab_config:
   gitlab_logs:
   gitlab_data:
+  tfs_repos:

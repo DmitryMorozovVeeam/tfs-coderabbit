@@ -14,6 +14,14 @@ Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
 │  └───────────────┬────────────────┘  │
 │                  │                   │
 │  ┌───────────────┴────────────────┐  │
+│  │  gitlab-tfs-sync               │  │
+│  │  git mirror + PR bridge        │  │
+│  └───┬───────────────────┬────────┘  │
+│      │ git fetch         │ REST API  │
+│      ▼                   ▼           │
+│  TFS / Azure DevOps Git Repos        │
+│                                      │
+│  ┌────────────────────────────────┐  │
 │  │  gitlab-tunnel (cloudflared)   │  │
 │  │  outbound tunnel → Cloudflare  │  │
 │  └───────────────┬────────────────┘  │
@@ -65,6 +73,10 @@ Run with no arguments for an interactive menu, or pass a flag directly:
 | `-CodeRabbit` | Set up CodeRabbit AI code review |
 | `-Tunnel` | Start Cloudflare tunnel & test connectivity |
 | `-Destroy` | Remove container + image (confirms first) |
+| `-TFSSetup` | Configure TFS/Azure DevOps mirroring |
+| `-TFSStatus` | Show TFS sync container status + recent log |
+| `-TFSSyncNow` | Restart sync container (triggers immediate sync) |
+| `-TFSLogs` | Stream TFS sync container logs |
 | `-Help` | Show usage |
 
 ## Environment Variables (`.env`)
@@ -122,6 +134,55 @@ CodeRabbit registers a webhook in GitLab automatically; every new Merge Request 
 > [named Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) with a custom domain.
 
 Copy `.coderabbit.yaml` to each repo root to customise review behaviour.
+
+## TFS / Azure DevOps Integration
+
+```powershell
+./gitlab-tfs.ps1 -TFSSetup    # one-time wizard: configure, build, start
+./gitlab-tfs.ps1 -TFSStatus   # show sync health + recent log
+./gitlab-tfs.ps1 -TFSSyncNow  # trigger an immediate sync cycle
+./gitlab-tfs.ps1 -TFSLogs     # stream live sync logs
+```
+
+### What `-TFSSetup` does
+1. Prompts for TFS URL, team project name, and a PAT (input is masked)
+2. Tests connectivity and lists all available repos in the project
+3. Lets you choose which repos to mirror (or mirror all)
+4. Creates a dedicated scoped GitLab token for the sync container via the Rails console
+5. Saves all settings to `.env`
+6. Builds the `sync` Docker image and starts the `gitlab-tfs-sync` container
+
+### How the sync works
+
+The `gitlab-tfs-sync` container runs a continuous loop (default: every 60 s) that:
+
+| Step | What happens |
+|------|--------------|
+| Git mirror | `git clone --mirror` / `git fetch` from TFS → `git push --mirror` to GitLab, all branches and tags |
+| PR bridge | For every active TFS PR without a GitLab MR: creates a mirror MR tagged `tfs-pr` with the TFS PR id embedded in the description |
+| Review feedback | For every GitLab MR with new CodeRabbit comments: posts them as thread comments on the originating TFS PR |
+| Cleanup | Closes GitLab MRs whose TFS PRs have been completed / abandoned |
+
+### Required TFS PAT scopes
+
+| Scope | Used for |
+|-------|----------|
+| Code (read) | `git fetch` + REST API to list repos / PRs |
+| Pull Request Threads (read + write) | Post CodeRabbit review comments back to TFS |
+
+### Environment variables
+
+All TFS variables are written to `.env` by `-TFSSetup`. They can also be set manually:
+
+| Variable | Description |
+|----------|-------------|
+| `TFS_URL` | TFS server URL including collection |
+| `TFS_PROJECT` | Team project name |
+| `TFS_PAT` | TFS / Azure DevOps Personal Access Token |
+| `TFS_REPOS` | Comma-separated repo list (empty = all) |
+| `GITLAB_TFS_TOKEN` | GitLab PAT for the sync container (created by `-TFSSetup`) |
+| `GITLAB_TFS_NAMESPACE` | GitLab group for mirrors (default: `tfs-mirrors`) |
+| `TFS_SYNC_INTERVAL` | Seconds between sync cycles (default: `60`) |
 
 ## Troubleshooting
 

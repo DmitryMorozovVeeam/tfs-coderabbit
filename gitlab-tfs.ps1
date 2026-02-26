@@ -19,6 +19,10 @@ param(
     [Parameter(ParameterSetName = 'CodeRabbit', Mandatory)][switch]$CodeRabbit,
     [Parameter(ParameterSetName = 'Tunnel',     Mandatory)][switch]$Tunnel,
     [Parameter(ParameterSetName = 'Destroy',    Mandatory)][switch]$Destroy,
+    [Parameter(ParameterSetName = 'TFSSetup',   Mandatory)][switch]$TFSSetup,
+    [Parameter(ParameterSetName = 'TFSStatus',  Mandatory)][switch]$TFSStatus,
+    [Parameter(ParameterSetName = 'TFSSyncNow', Mandatory)][switch]$TFSSyncNow,
+    [Parameter(ParameterSetName = 'TFSLogs',    Mandatory)][switch]$TFSLogs,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
 $ErrorActionPreference = 'Stop'
@@ -64,6 +68,23 @@ function Get-EnvOrDefault {
     param([string]$Name, [string]$Default)
     $val = [Environment]::GetEnvironmentVariable($Name)
     if ([string]::IsNullOrEmpty($val)) { $Default } else { $val }
+}
+
+# Update (or append) a single KEY=VALUE line in .env without destroying other entries
+function Set-EnvValue {
+    param([string]$Name, [string]$Value)
+    $path = '.env'
+    if (-not (Test-Path $path)) { return }
+    $lines = Get-Content $path -Encoding UTF8
+    $found = $false
+    $lines = $lines | ForEach-Object {
+        if ($_ -match "^${Name}=") { "${Name}=${Value}"; $found = $true }
+        else { $_ }
+    }
+    if (-not $found) { $lines += "${Name}=${Value}" }
+    $lines | Set-Content $path -Encoding UTF8
+    # Reload into current process
+    [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
 }
 
 function Open-BrowserUrl {
@@ -477,6 +498,179 @@ function Cmd-Tunnel {
 }
 
 # =============================================================================
+# TFS-Git integration commands
+# =============================================================================
+
+function Invoke-TFSCompose {
+    param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
+    if ($script:ComposeCmd -eq 'docker compose') { & docker compose --profile tfs @Arguments }
+    else                                          { & docker-compose --profile tfs @Arguments }
+}
+
+function Cmd-TFSSetup {
+    Write-Host ''
+    Write-Host '=== TFS-Git Integration Setup ===' -ForegroundColor Cyan
+    Write-Host ''
+
+    # ── Step 1: GitLab health ────────────────────────────────────────────────
+    Write-Host '[1/6] Checking GitLab health...'
+    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
+    $httpCode = (curl -s -o /dev/null -w '%{http_code}' -m 5 -L "http://localhost:$port/" 2>$null)
+    if ($httpCode -match '^\s*[1-4][0-9][0-9]\s*$') {
+        Write-Host '  GitLab is HEALTHY' -ForegroundColor Green
+    } else {
+        Write-Host '  GitLab is NOT READY — start it first with -Start' -ForegroundColor Red
+        return
+    }
+    Write-Host ''
+
+    # ── Step 2: TFS connection details ───────────────────────────────────────
+    Write-Host '[2/6] TFS / Azure DevOps connection'
+    Write-Host '  Examples:'
+    Write-Host '    https://tfs.company.com/tfs/DefaultCollection' -ForegroundColor DarkGray
+    Write-Host '    https://dev.azure.com/orgname'                 -ForegroundColor DarkGray
+    Write-Host ''
+    $tfsUrl     = (Read-Host '  TFS URL (including collection)').TrimEnd('/')
+    $tfsProject = Read-Host '  Team project name'
+    Write-Host '  Enter a PAT with Code (read) and Pull Request Threads (read+write) scopes:'
+    $secPat = Read-Host '  Personal Access Token' -AsSecureString
+    $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPat)
+    $tfsPat = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    Write-Host ''
+
+    # ── Step 3: Test TFS connectivity and list repos ─────────────────────────
+    Write-Host '[3/6] Testing TFS connectivity...'
+    $tfsAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":${tfsPat}"))
+    $tfsHeaders = @{ Authorization = "Basic $tfsAuth"; 'Content-Type' = 'application/json' }
+    try {
+        $reposResult = Invoke-RestMethod `
+            -Uri "${tfsUrl}/${tfsProject}/_apis/git/repositories?api-version=1.0" `
+            -Headers $tfsHeaders `
+            -TimeoutSec 15 `
+            -ErrorAction Stop
+        $allRepos = $reposResult.value | ForEach-Object { $_.name }
+        Write-Host "  Connected. Found $($allRepos.Count) repo(s):" -ForegroundColor Green
+        $allRepos | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkGray }
+    } catch {
+        Write-Host "  ERROR: Could not reach TFS — $_" -ForegroundColor Red
+        Write-Host '  Check TFS_URL, project name, and PAT scopes.' -ForegroundColor Yellow
+        return
+    }
+    Write-Host ''
+
+    # ── Step 4: Repo selection ────────────────────────────────────────────────
+    Write-Host '[4/6] Repository selection'
+    Write-Host '  Press Enter to mirror ALL repos, or enter a comma-separated list:'
+    $repoInput = Read-Host '  Repos to mirror (empty = all)'
+    $tfsRepos  = $repoInput.Trim()
+    if ($tfsRepos) {
+        Write-Host "  Will mirror: $tfsRepos" -ForegroundColor Green
+    } else {
+        Write-Host '  Will mirror: all repos' -ForegroundColor Green
+    }
+    Write-Host ''
+
+    # ── Step 5: Create dedicated GitLab PAT for the sync container ───────────
+    Write-Host '[5/6] Creating GitLab sync token (via Rails console)...'
+    Write-Host '  This may take 30-60 s...' -ForegroundColor DarkGray
+    $ns        = Get-EnvOrDefault 'GITLAB_TFS_NAMESPACE' 'tfs-mirrors'
+    $tokenName = "tfs-sync-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $rubyCode  = "u=User.find_by_username('root');" +
+                 "t=u.personal_access_tokens.create!(name:'$tokenName'," +
+                 "scopes:['api','read_user','read_repository']," +
+                 "expires_at:365.days.from_now);" +
+                 "puts('TOKEN:'+t.token)"
+
+    $rawOutput = (docker exec gitlab-tfs-mirror gitlab-rails runner $rubyCode 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $rawOutput -notmatch 'TOKEN:') {
+        Write-Host '  Failed to create GitLab token:' -ForegroundColor Red
+        Write-Host "  $rawOutput" -ForegroundColor Red
+        return
+    }
+    $glToken = ($rawOutput | Select-String -Pattern 'TOKEN:([A-Za-z0-9_-]+)').Matches[0].Groups[1].Value
+    Write-Host "  GitLab token created: $tokenName" -ForegroundColor Green
+    Write-Host ''
+
+    # ── Step 6: Save to .env and start the sync container ───────────────────
+    Write-Host '[6/6] Saving configuration and starting sync service...'
+    Set-EnvValue 'TFS_URL'              $tfsUrl
+    Set-EnvValue 'TFS_PROJECT'          $tfsProject
+    Set-EnvValue 'TFS_PAT'              $tfsPat
+    Set-EnvValue 'TFS_REPOS'            $tfsRepos
+    Set-EnvValue 'GITLAB_TFS_TOKEN'     $glToken
+    Set-EnvValue 'GITLAB_TFS_NAMESPACE' $ns
+    Set-EnvValue 'TFS_SYNC_INTERVAL'    (Get-EnvOrDefault 'TFS_SYNC_INTERVAL' '60')
+    Write-Host '  Configuration saved to .env' -ForegroundColor Green
+
+    # Reload env so Compose picks up the new values
+    Import-EnvFile
+
+    Write-Host '  Building sync image...'
+    Invoke-TFSCompose build --no-cache sync
+    Write-Host '  Starting sync container (detached)...'
+    Invoke-TFSCompose up --detach sync
+
+    Write-Host ''
+    Write-Host '=== TFS Integration Active ===' -ForegroundColor Green
+    Write-Host ''
+    Write-Host '  The sync container mirrors TFS repos to GitLab and bridges PRs.'
+    Write-Host '  View sync activity: ./gitlab-tfs.ps1 -TFSLogs'
+    Write-Host "  GitLab namespace : http://localhost:$port/${ns}"
+    Write-Host ''
+}
+
+function Cmd-TFSStatus {
+    Write-Host ''
+    Write-Host '=== TFS Sync Status ===' -ForegroundColor Cyan
+    Write-Host ''
+
+    $running = docker ps --filter 'name=gitlab-tfs-sync' --format '{{.Status}}' 2>$null
+    if ($running) {
+        Write-Host "  Container : $running" -ForegroundColor Green
+    } else {
+        Write-Host '  Container : NOT RUNNING' -ForegroundColor Yellow
+        Write-Host '  Run ./gitlab-tfs.ps1 -TFSSetup to configure.' -ForegroundColor DarkGray
+        return
+    }
+
+    $tfsUrl     = Get-EnvOrDefault 'TFS_URL'     '(not set)'
+    $tfsProject = Get-EnvOrDefault 'TFS_PROJECT' '(not set)'
+    $tfsRepos   = Get-EnvOrDefault 'TFS_REPOS'   '(all)'
+    $ns         = Get-EnvOrDefault 'GITLAB_TFS_NAMESPACE' 'tfs-mirrors'
+    $interval   = Get-EnvOrDefault 'TFS_SYNC_INTERVAL' '60'
+    Write-Host "  TFS URL   : $tfsUrl/$tfsProject"
+    Write-Host "  Repos     : $( if ($tfsRepos) { $tfsRepos } else { 'all (auto-discover)' } )"
+    Write-Host "  Namespace : $ns"
+    Write-Host "  Interval  : ${interval}s"
+    Write-Host ''
+    Write-Host '  Recent sync log (last 25 lines):' -ForegroundColor Cyan
+    Invoke-TFSCompose logs --tail 25 sync 2>&1 | ForEach-Object {
+        Write-Host "  $_" -ForegroundColor DarkGray
+    }
+    Write-Host ''
+}
+
+function Cmd-TFSSyncNow {
+    Write-Host ''
+    Write-Host '=== Triggering Immediate Sync ===' -ForegroundColor Cyan
+    Write-Host ''
+    $running = docker ps --filter 'name=gitlab-tfs-sync' --format '{{.ID}}' 2>$null
+    if (-not $running) {
+        Write-Host '  Sync container is not running. Start with -TFSSetup first.' -ForegroundColor Yellow
+        return
+    }
+    Write-Host '  Restarting sync container (triggers a fresh sync cycle)...'
+    Invoke-TFSCompose restart sync
+    Write-Host '  Done. Follow progress with: ./gitlab-tfs.ps1 -TFSLogs' -ForegroundColor Green
+    Write-Host ''
+}
+
+function Cmd-TFSLogs {
+    Invoke-TFSCompose logs -f --tail 50 sync
+}
+
+# =============================================================================
 # Interactive menu
 # =============================================================================
 
@@ -486,18 +680,25 @@ function Show-Menu {
     Write-Host '|   GitLab Container Manager   |' -ForegroundColor Cyan
     Write-Host '+==============================+' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  1) Setup    - First-time build'
-    Write-Host '  2) Start    - Start container'
-    Write-Host '  3) Stop     - Stop container'
-    Write-Host '  4) Restart  - Restart container'
-    Write-Host '  5) Logs     - View container logs'
-    Write-Host '  6) Status   - Show health'
-    Write-Host '  7) Backup   - Backup .env'
+    Write-Host '  1) Setup      - First-time build'
+    Write-Host '  2) Start      - Start container'
+    Write-Host '  3) Stop       - Stop container'
+    Write-Host '  4) Restart    - Restart container'
+    Write-Host '  5) Logs       - View container logs'
+    Write-Host '  6) Status     - Show health'
+    Write-Host '  7) Backup     - Backup .env'
     Write-Host '  8) Export     - Save image to .tar.gz'
     Write-Host '  9) Import     - Load image from .tar.gz'
     Write-Host ' 10) CodeRabbit - Setup AI code review'
     Write-Host ' 11) Tunnel     - Start & test Cloudflare tunnel'
     Write-Host ' 12) Destroy    - Remove container'
+    Write-Host ''
+    Write-Host ' --- TFS Integration ---'                  -ForegroundColor DarkCyan
+    Write-Host ' 13) TFS Setup    - Configure TFS mirroring' -ForegroundColor DarkCyan
+    Write-Host ' 14) TFS Status   - Show sync container status' -ForegroundColor DarkCyan
+    Write-Host ' 15) TFS Sync Now - Trigger immediate sync'  -ForegroundColor DarkCyan
+    Write-Host ' 16) TFS Logs     - Stream sync logs'         -ForegroundColor DarkCyan
+    Write-Host ''
     Write-Host '  0) Exit'
     Write-Host ''
 }
@@ -505,7 +706,7 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-12]'
+        $choice = Read-Host '  Choose [0-16]'
         Write-Host ''
         if ($choice -eq '0') {
             Write-Host 'Bye.'
@@ -525,6 +726,10 @@ function Start-InteractiveMenu {
                 '10' { Cmd-CodeRabbit }
                 '11' { Cmd-Tunnel }
                 '12' { Cmd-Destroy }
+                '13' { Cmd-TFSSetup }
+                '14' { Cmd-TFSStatus }
+                '15' { Cmd-TFSSyncNow }
+                '16' { Cmd-TFSLogs }
                 default { Write-Host 'Invalid choice.' }
             }
         } catch {
@@ -540,20 +745,24 @@ function Start-InteractiveMenu {
 # =============================================================================
 
 switch ($PSCmdlet.ParameterSetName) {
-    'Setup'   { Cmd-Setup }
-    'Start'   { Cmd-Start }
-    'Stop'    { Cmd-Stop }
-    'Restart' { Cmd-Restart }
-    'Logs'    { Cmd-Logs }
-    'Status'  { Cmd-Status }
-    'Backup'  { Cmd-Backup }
+    'Setup'      { Cmd-Setup }
+    'Start'      { Cmd-Start }
+    'Stop'       { Cmd-Stop }
+    'Restart'    { Cmd-Restart }
+    'Logs'       { Cmd-Logs }
+    'Status'     { Cmd-Status }
+    'Backup'     { Cmd-Backup }
     'Export'     { Cmd-Export }
     'Import'     { Cmd-Import -FilePath $File }
     'CodeRabbit' { Cmd-CodeRabbit }
     'Tunnel'     { Cmd-Tunnel }
     'Destroy'    { Cmd-Destroy }
+    'TFSSetup'   { Cmd-TFSSetup }
+    'TFSStatus'  { Cmd-TFSStatus }
+    'TFSSyncNow' { Cmd-TFSSyncNow }
+    'TFSLogs'    { Cmd-TFSLogs }
     'Help'       {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-Help]'
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-TFSSetup|-TFSStatus|-TFSSyncNow|-TFSLogs|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }
