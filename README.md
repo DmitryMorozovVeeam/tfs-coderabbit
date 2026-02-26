@@ -1,6 +1,8 @@
-# GitLab Container Manager
+# TFS / Azure DevOps → GitLab Mirror with CodeRabbit AI Review
 
-Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
+Mirrors **TFS / Azure DevOps** Git repositories into a self-hosted **GitLab CE 18.9** instance,
+exposes it through a **Cloudflare Tunnel**, and feeds **CodeRabbit AI** review comments
+back to the originating TFS pull requests — all managed by a cross-platform PowerShell 7 script.
 
 ## Architecture
 
