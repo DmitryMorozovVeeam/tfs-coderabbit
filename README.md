@@ -10,6 +10,7 @@ Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
 │  ┌────────────────────────────────┐  │
 │  │  gitlab-tfs-mirror             │  │
 │  │  GitLab CE · port 8081         │  │
+│  │  (mirror of TFS/Azure repos)   │  │
 │  └───────────────┬────────────────┘  │
 │                  │                   │
 │  ┌───────────────┴────────────────┐  │
@@ -21,7 +22,7 @@ Dockerized **GitLab CE 18.9** managed by a cross-platform PowerShell 7 script.
                    ▼
           ┌────────────────┐
           │ CodeRabbit.ai  │
-          │ (AI PR review) │
+          │ (AI MR review) │
           └────────────────┘
 ```
 
@@ -34,6 +35,7 @@ To wipe everything: `docker compose down -v --rmi local`.
 - Docker Engine 20.10+ with Compose v2
 - Git
 - PowerShell 7+ (`snap install powershell` / `brew install powershell`)
+- `curl` (used by health checks and tunnel connectivity tests; pre-installed on macOS and most Linux distros)
 
 ## Quick Start
 
@@ -102,12 +104,23 @@ permanent URL, configure a named Cloudflare Tunnel with a custom domain.
 ## CodeRabbit (AI Code Review)
 
 ```powershell
-./gitlab-tfs.ps1 -Tunnel       # get the public URL first
-./gitlab-tfs.ps1 -CodeRabbit   # create PAT + show setup steps
+./gitlab-tfs.ps1 -CodeRabbit   # full setup: tunnel → PAT → browser
 ```
 
-Creates a Personal Access Token and prints setup steps for [app.coderabbit.ai](https://app.coderabbit.ai).
-Use the tunnel URL (from `-Tunnel`) as the GitLab URL in CodeRabbit.
+`-CodeRabbit` is a single end-to-end command that:
+1. Verifies GitLab is healthy
+2. Starts the Cloudflare tunnel if not already running and retrieves its public URL
+3. Tests that the tunnel is reachable from the internet
+4. Creates a scoped Personal Access Token (`api`, `read_user`, `read_repository`) via the GitLab Rails console
+5. Opens `https://app.coderabbit.ai` and displays the exact values to paste:
+   - **GitLab URL** — the `*.trycloudflare.com` tunnel address
+   - **Access Token** — the generated PAT
+
+CodeRabbit registers a webhook in GitLab automatically; every new Merge Request then receives an AI code review.
+
+> **Note:** The tunnel URL changes on each restart. For a permanent URL, configure a
+> [named Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) with a custom domain.
+
 Copy `.coderabbit.yaml` to each repo root to customise review behaviour.
 
 ## Troubleshooting
@@ -117,6 +130,7 @@ Copy `.coderabbit.yaml` to each repo root to customise review behaviour.
 | Port already in use | Change `GITLAB_HTTP_PORT` in `.env` |
 | Not ready after 5 min | Check `-Logs`; GitLab needs ≥ 4 GB RAM |
 | Browser doesn't open | Open `http://localhost:<port>` manually |
+| `-CodeRabbit` / `-Status` reports NOT READY despite container being healthy | GitLab 18.x removed the `/-/readiness` endpoint; ensure you are on the latest script version which uses `curl` for health checks |
 
 ## Requirements
 

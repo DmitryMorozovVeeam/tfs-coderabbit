@@ -144,13 +144,11 @@ function Cmd-Start {
 
     # Detached process: poll readiness then open browser — survives parent script exit
     $pollScript = @"
-`$readinessUrl = '$url/-/readiness'
-`$deadline     = (Get-Date).AddMinutes(10)
+`$pollUrl  = '$url/'
+`$deadline = (Get-Date).AddMinutes(10)
 while ((Get-Date) -lt `$deadline) {
-    try {
-        `$resp = Invoke-WebRequest -Uri `$readinessUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        if (`$resp.StatusCode -lt 500) { break }
-    } catch {}
+    `$code = (curl -s -o /dev/null -w '%{http_code}' -m 5 -L "`$pollUrl" 2>`$null)
+    if (`$code -match '^\ *[1-4][0-9][0-9]\ *$') { break }
     Start-Sleep -Seconds 10
 }
 if (`$IsMacOS) {
@@ -206,10 +204,10 @@ function Cmd-Status {
     Invoke-Compose ps
     Write-Host ''
     $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
-    try {
-        $null = Invoke-WebRequest -Uri "http://localhost:$port/-/readiness" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    $httpCode = (curl -s -o /dev/null -w '%{http_code}' -m 5 -L "http://localhost:$port/" 2>$null)
+    if ($httpCode -match '^\s*[1-4][0-9][0-9]\s*$') {
         Write-Host 'GitLab: HEALTHY' -ForegroundColor Green
-    } catch {
+    } else {
         Write-Host 'GitLab: NOT READY (starting up or stopped)' -ForegroundColor Yellow
     }
     Write-Host ''
@@ -291,33 +289,112 @@ function Cmd-Import {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Shared helper: ensure tunnel is running and return its public URL.
+# Returns $null and prints an error if the URL cannot be determined.
+# ---------------------------------------------------------------------------
+function Get-TunnelUrl {
+    $running = docker ps --filter 'name=gitlab-tunnel' --format '{{.Status}}' 2>$null
+
+    if (-not $running) {
+        Write-Host '  Starting Cloudflare tunnel (cloudflared)...'
+        if ($script:ComposeCmd -eq 'docker compose') {
+            & docker compose --profile tunnel up --detach tunnel 2>&1 | Out-Null
+        } else {
+            & docker-compose --profile tunnel up --detach tunnel 2>&1 | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  ERROR: Failed to start tunnel container.' -ForegroundColor Red
+            return $null
+        }
+        Write-Host '  Waiting for tunnel to establish (10 s)...' -ForegroundColor DarkGray
+        Start-Sleep -Seconds 10
+    } else {
+        Write-Host '  Tunnel container is already running.' -ForegroundColor Green
+    }
+
+    # Try up to 2 times with a 10-second gap to read the URL from logs
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $logs = if ($script:ComposeCmd -eq 'docker compose') {
+            (docker compose --profile tunnel logs tunnel 2>&1) -join "`n"
+        } else {
+            (docker-compose --profile tunnel logs tunnel 2>&1) -join "`n"
+        }
+        if ($logs -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+            return $matches[1]
+        }
+        if ($attempt -lt 2) {
+            Write-Host '  URL not visible yet — retrying in 10 s...' -ForegroundColor DarkGray
+            Start-Sleep -Seconds 10
+        }
+    }
+
+    Write-Host '  ERROR: Could not detect tunnel URL from logs.' -ForegroundColor Red
+    Write-Host '  Run "./gitlab-tfs.ps1 -Tunnel" to inspect manually.' -ForegroundColor DarkGray
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Shared helper: test that a URL responds over HTTP (any status = success).
+# Prints result; returns $true / $false.
+# ---------------------------------------------------------------------------
+function Test-UrlReachable {
+    param([string]$Url)
+    try {
+        $curlOutput = (curl -s -o /dev/null -w '%{http_code}' -m 15 -L "$Url/" 2>&1)
+        if ($curlOutput -match '(\d{3})' -and [int]$matches[1] -gt 0) { return $true }
+    } catch {}
+    try {
+        $resp = Invoke-WebRequest -Uri "$Url/" -UseBasicParsing -TimeoutSec 15 `
+                    -MaximumRedirection 0 -SkipHttpErrorCheck -ErrorAction Stop
+        return $true
+    } catch {
+        return ($null -ne $_.Exception.Response)
+    }
+}
+
 function Cmd-CodeRabbit {
     Write-Host ''
     Write-Host '=== CodeRabbit AI Review Setup ===' -ForegroundColor Cyan
     Write-Host ''
 
-    # 1. Check GitLab health
-    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
-    $baseUrl = "http://localhost:$port"
-    Write-Host '[1/3] Checking GitLab readiness...'
-    try {
-        $null = Invoke-WebRequest -Uri "$baseUrl/-/readiness" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    # ── Step 1: GitLab health ────────────────────────────────────────────────
+    $port    = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
+    $localUrl = "http://localhost:$port"
+    Write-Host '[1/4] Checking GitLab readiness...'
+    $httpCode = (curl -s -o /dev/null -w '%{http_code}' -m 5 -L "$localUrl/" 2>$null)
+    if ($httpCode -match '^\s*[1-4][0-9][0-9]\s*$') {
         Write-Host '  GitLab is HEALTHY' -ForegroundColor Green
-    } catch {
+    } else {
         Write-Host '  GitLab is NOT READY — start it first with -Start' -ForegroundColor Red
         return
     }
     Write-Host ''
 
-    # 2. Create Personal Access Token via Rails console
-    Write-Host '[2/3] Creating Personal Access Token (api scope)...'
+    # ── Step 2: Cloudflare tunnel ────────────────────────────────────────────
+    Write-Host '[2/4] Ensuring Cloudflare tunnel is running...'
+    $tunnelUrl = Get-TunnelUrl
+    if (-not $tunnelUrl) { return }
+    Write-Host "  Public URL: $tunnelUrl" -ForegroundColor Green
+
+    Write-Host '  Testing connectivity through the tunnel...' -ForegroundColor DarkGray
+    if (Test-UrlReachable $tunnelUrl) {
+        Write-Host '  Tunnel is REACHABLE' -ForegroundColor Green
+    } else {
+        Write-Host '  WARNING: Tunnel URL did not respond — CodeRabbit may not be able to reach GitLab.' -ForegroundColor Yellow
+        Write-Host '  Continuing anyway; verify with "./gitlab-tfs.ps1 -Tunnel".' -ForegroundColor DarkGray
+    }
+    Write-Host ''
+
+    # ── Step 3: Personal Access Token ───────────────────────────────────────
+    Write-Host '[3/4] Creating GitLab Personal Access Token...'
     Write-Host '  This may take 30-60 s (Rails console startup)...' -ForegroundColor DarkGray
     $tokenName = "coderabbit-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    $rubyCode = "u=User.find_by_username('root');" +
-                "t=u.personal_access_tokens.create!(name:'$tokenName'," +
-                "scopes:['api','read_user','read_repository']," +
-                "expires_at:365.days.from_now);" +
-                "puts('TOKEN:'+t.token)"
+    $rubyCode  = "u=User.find_by_username('root');" +
+                 "t=u.personal_access_tokens.create!(name:'$tokenName'," +
+                 "scopes:['api','read_user','read_repository']," +
+                 "expires_at:365.days.from_now);" +
+                 "puts('TOKEN:'+t.token)"
 
     $rawOutput = (docker exec gitlab-tfs-mirror gitlab-rails runner $rubyCode 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) {
@@ -325,7 +402,6 @@ function Cmd-CodeRabbit {
         Write-Host "  $rawOutput" -ForegroundColor Red
         return
     }
-
     if ($rawOutput -match 'TOKEN:([A-Za-z0-9_-]+)') {
         $pat = $matches[1]
     } else {
@@ -336,24 +412,34 @@ function Cmd-CodeRabbit {
     Write-Host "  Token created: $tokenName" -ForegroundColor Green
     Write-Host ''
 
-    # 3. Display setup instructions
-    Write-Host '[3/3] Complete setup at CodeRabbit:' -ForegroundColor Cyan
+    # ── Step 4: Instructions + open browser ─────────────────────────────────
+    Write-Host '[4/4] Opening CodeRabbit — complete the connection in your browser.' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  1. Open  https://app.coderabbit.ai  and sign up / log in'
-    Write-Host '  2. Choose "Add Self-Managed GitLab"'
-    Write-Host '  3. Enter the values below:'
+    Write-Host '  ┌─────────────────────────────────────────────────────────┐' -ForegroundColor White
+    Write-Host '  │  On https://app.coderabbit.ai :                         │' -ForegroundColor White
+    Write-Host '  │  1. Sign up / log in                                    │' -ForegroundColor White
+    Write-Host '  │  2. Click "Add a self-managed GitLab"                   │' -ForegroundColor White
+    Write-Host '  │  3. Enter the values below and click Save               │' -ForegroundColor White
+    Write-Host '  └─────────────────────────────────────────────────────────┘' -ForegroundColor White
     Write-Host ''
-    Write-Host "     GitLab URL:    $baseUrl" -ForegroundColor White
-    Write-Host "     Access Token:  $pat" -ForegroundColor Yellow
+    Write-Host "  GitLab URL    : $tunnelUrl" -ForegroundColor Yellow
+    Write-Host "  Access Token  : $pat"       -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  CodeRabbit will auto-configure webhooks once connected.'
+    Write-Host '  CodeRabbit will automatically register a webhook in GitLab.' -ForegroundColor DarkGray
+    Write-Host '  After that, every new Merge Request gets an AI code review.' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '  NOTE: This GitLab is not publicly accessible.' -ForegroundColor Yellow
-    Write-Host '  Start the Cloudflare tunnel first:' -ForegroundColor Yellow
-    Write-Host '    ./gitlab-tfs.ps1 -Tunnel'
-    Write-Host '  Then use the tunnel URL as the GitLab URL.'
+    Write-Host '  IMPORTANT: The tunnel URL changes on each restart.' -ForegroundColor Yellow
+    Write-Host '  For a permanent URL, configure a named Cloudflare Tunnel' -ForegroundColor Yellow
+    Write-Host '  with a custom domain (requires a free Cloudflare account).' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  Copy .coderabbit.yaml to each repo root to customize reviews.' -ForegroundColor Green
+    Write-Host '  TIP: Add a .coderabbit.yaml to each repo root to customise reviews.' -ForegroundColor Green
+    Write-Host ''
+
+    $opened = Open-BrowserUrl 'https://app.coderabbit.ai'
+    if (-not $opened) {
+        Write-Host '  Could not open browser automatically.' -ForegroundColor DarkGray
+        Write-Host '  Navigate to https://app.coderabbit.ai manually.' -ForegroundColor DarkGray
+    }
     Write-Host ''
 }
 
@@ -362,89 +448,26 @@ function Cmd-Tunnel {
     Write-Host '=== Cloudflare Tunnel ===' -ForegroundColor Cyan
     Write-Host ''
 
-    # Check if tunnel is already running
-    $running = docker ps --filter 'name=gitlab-tunnel' --format '{{.Status}}' 2>$null
-    if (-not $running) {
-        Write-Host '[1/3] Starting tunnel (cloudflared)...'
-        if ($script:ComposeCmd -eq 'docker compose') {
-            & docker compose --profile tunnel up --detach tunnel
-        } else {
-            & docker-compose --profile tunnel up --detach tunnel
-        }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host '  Failed to start tunnel.' -ForegroundColor Red
-            return
-        }
-        Write-Host '  Waiting for tunnel to establish...'
-        Start-Sleep -Seconds 10
-    } else {
-        Write-Host '[1/3] Tunnel container is already running.' -ForegroundColor Green
-    }
-
-    # Parse tunnel URL from cloudflared logs
-    Write-Host '[2/3] Fetching tunnel URL...'
-    $logs = if ($script:ComposeCmd -eq 'docker compose') {
-        (docker compose --profile tunnel logs tunnel 2>&1) -join "`n"
-    } else {
-        (docker-compose --profile tunnel logs tunnel 2>&1) -join "`n"
-    }
-
-    $tunnelUrl = $null
-    if ($logs -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-        $tunnelUrl = $matches[1]
-    }
-
-    if (-not $tunnelUrl) {
-        Write-Host '  Could not detect tunnel URL yet — retrying in 10 s...' -ForegroundColor Yellow
-        Start-Sleep -Seconds 10
-        $logs = if ($script:ComposeCmd -eq 'docker compose') {
-            (docker compose --profile tunnel logs tunnel 2>&1) -join "`n"
-        } else {
-            (docker-compose --profile tunnel logs tunnel 2>&1) -join "`n"
-        }
-        if ($logs -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-            $tunnelUrl = $matches[1]
-        }
-    }
-
-    if (-not $tunnelUrl) {
-        Write-Host '  Could not detect tunnel URL. Recent logs:' -ForegroundColor Red
-        $logs -split "`n" | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-        return
-    }
+    # ── Step 1: Start (or verify) tunnel container ───────────────────────────
+    Write-Host '[1/3] Checking / starting tunnel...'
+    $tunnelUrl = Get-TunnelUrl
+    if (-not $tunnelUrl) { return }
     Write-Host "  Tunnel URL: $tunnelUrl" -ForegroundColor Green
     Write-Host ''
 
-    # Test connectivity through the tunnel (any HTTP response = tunnel works)
-    Write-Host '[3/3] Testing tunnel connectivity...'
-    $testOk = $false
-    try {
-        # Use curl to avoid PowerShell's redirect policy issues (HTTPS→HTTP)
-        $curlOutput = (curl -s -o /dev/null -w '%{http_code}' -m 15 -L "$tunnelUrl/" 2>&1)
-        if ($curlOutput -match '(\d{3})') {
-            $code = [int]$matches[1]
-            if ($code -gt 0) {
-                Write-Host "  Tunnel is WORKING (HTTP $code)" -ForegroundColor Green
-                $testOk = $true
-            }
-        }
-    } catch {}
-    if (-not $testOk) {
-        # Fallback: try PowerShell with MaximumRedirection 0 to just check initial response
-        try {
-            $resp = Invoke-WebRequest -Uri "$tunnelUrl/" -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -SkipHttpErrorCheck -ErrorAction Stop
-            Write-Host "  Tunnel is WORKING (HTTP $($resp.StatusCode))" -ForegroundColor Green
-        } catch {
-            if ($_.Exception.Response) {
-                Write-Host '  Tunnel is WORKING (redirect received)' -ForegroundColor Green
-            } else {
-                Write-Host '  Tunnel test FAILED — no response from tunnel URL.' -ForegroundColor Yellow
-                Write-Host "  Error: $_" -ForegroundColor DarkGray
-            }
-        }
+    # ── Step 2: Connectivity test ────────────────────────────────────────────
+    Write-Host '[2/3] Testing tunnel connectivity...'
+    if (Test-UrlReachable $tunnelUrl) {
+        Write-Host '  Tunnel is WORKING' -ForegroundColor Green
+    } else {
+        Write-Host '  WARNING: No response through the tunnel — it may still be warming up.' -ForegroundColor Yellow
     }
     Write-Host ''
-    Write-Host '  Use this URL in CodeRabbit setup:' -ForegroundColor Cyan
+
+    # ── Step 3: Summary ──────────────────────────────────────────────────────
+    Write-Host '[3/3] Summary'
+    Write-Host ''
+    Write-Host '  Use this URL for CodeRabbit / external access:' -ForegroundColor Cyan
     Write-Host "  $tunnelUrl" -ForegroundColor Yellow
     Write-Host ''
     Write-Host '  NOTE: URL changes each time the tunnel restarts.' -ForegroundColor DarkGray
