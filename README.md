@@ -86,7 +86,7 @@ Run with no arguments for an interactive menu, or pass a flag directly:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GITLAB_HTTP_PORT` | `8081` | Host HTTP port |
-| `GITLAB_SSH_PORT` | `2222` | Host SSH port |
+| `GITLAB_SSH_PORT` | `2244` | Host SSH port |
 | `GITLAB_ROOT_PASSWORD` | `ChangeMe123!` | Initial root password |
 | `GITLAB_HOSTNAME` | `gitlab.local` | Hostname in `external_url` |
 | `GITLAB_TIMEZONE` | `UTC` | Time zone |
