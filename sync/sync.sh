@@ -65,7 +65,9 @@ tfs_api() {
     local method="$1"; local rel_path="$2"; shift 2
     local auth
     auth=$(printf ':%s' "$TFS_PAT" | base64 | tr -d '\n')
-    curl -sf \
+    # --location-trusted keeps the Authorization header on every redirect hop.
+    # Plain --location drops it, causing TF400813 (anonymous access) on TFS.
+    curl -sf --location-trusted --insecure \
         -X "$method" \
         -H "Authorization: Basic ${auth}" \
         -H "Content-Type: application/json" \

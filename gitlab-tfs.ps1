@@ -526,35 +526,70 @@ function Cmd-TFSSetup {
 
     # ── Step 2: TFS connection details ───────────────────────────────────────
     Write-Host '[2/6] TFS / Azure DevOps connection'
+    Write-Host '  The URL must end at the COLLECTION — do NOT include the project name in it.' -ForegroundColor DarkGray
     Write-Host '  Examples:'
     Write-Host '    https://tfs.company.com/tfs/DefaultCollection' -ForegroundColor DarkGray
+    Write-Host '    https://tfs.company.com/DefaultCollection'     -ForegroundColor DarkGray
     Write-Host '    https://dev.azure.com/orgname'                 -ForegroundColor DarkGray
     Write-Host ''
-    $tfsUrl     = (Read-Host '  TFS URL (including collection)').TrimEnd('/')
+    $tfsUrl     = (Read-Host '  TFS URL (including collection, NOT project)').TrimEnd('/')
     $tfsProject = Read-Host '  Team project name'
     Write-Host '  Enter a PAT with Code (read) and Pull Request Threads (read+write) scopes:'
     $secPat = Read-Host '  Personal Access Token' -AsSecureString
     $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPat)
-    $tfsPat = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    $tfsPat = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ([string]::IsNullOrWhiteSpace($tfsPat)) {
+        Write-Host '  ERROR: Personal Access Token cannot be empty.' -ForegroundColor Red
+        Write-Host '  Generate a PAT in TFS → Profile → Security → Personal access tokens.' -ForegroundColor Yellow
+        Write-Host '  Required scopes: Code (read)  +  Pull Request Threads (read & write).' -ForegroundColor Yellow
+        return
+    }
     Write-Host ''
 
     # ── Step 3: Test TFS connectivity and list repos ─────────────────────────
     Write-Host '[3/6] Testing TFS connectivity...'
-    $tfsAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":${tfsPat}"))
-    $tfsHeaders = @{ Authorization = "Basic $tfsAuth"; 'Content-Type' = 'application/json' }
+    # Use curl (not Invoke-RestMethod) because PowerShell drops the Authorization
+    # header when following HTTP redirects, causing TF400813 with a valid PAT.
+    # curl --location re-sends auth on every hop.
+    $tfsUri   = "${tfsUrl}/${tfsProject}/_apis/git/repositories?api-version=1.0"
+    Write-Host "  Calling: $tfsUri" -ForegroundColor DarkGray
+    Write-Host "  PAT length: $($tfsPat.Length) chars" -ForegroundColor DarkGray
+    # Send the Authorization header explicitly rather than using --user, so curl
+    # does NOT enter challenge-response negotiation (which silently skips Basic
+    # when the server advertises NTLM — common on TFS on-premises IIS).
+    # --location-trusted keeps ALL custom headers, including Authorization, on
+    # every redirect hop (plain --location strips auth headers on redirect).
+    $tfsAuth  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":${tfsPat}"))
+    $curlOut  = curl -sS --location-trusted --insecure `
+                     -H "Authorization: Basic ${tfsAuth}" `
+                     -H 'Content-Type: application/json' `
+                     -w "`n__HTTP_STATUS__%{http_code}" `
+                     --max-time 15 `
+                     $tfsUri 2>&1
+    $curlLines   = $curlOut -join "`n"
+    $httpStatus  = if ($curlLines -match '__HTTP_STATUS__(\d+)') { $Matches[1] } else { '???' }
+    $jsonBody    = ($curlLines -split '__HTTP_STATUS__')[0].Trim()
+    if ($httpStatus -notin @('200','203')) {
+        Write-Host "  ERROR: TFS returned HTTP $httpStatus" -ForegroundColor Red
+        Write-Host "  Response: $($jsonBody -replace '\s+',' ')" -ForegroundColor Red
+        Write-Host ''
+        Write-Host '  Checklist:' -ForegroundColor Yellow
+        Write-Host '    1. URL must be collection-only, e.g. https://tfs.host/DefaultCollection' -ForegroundColor Yellow
+        Write-Host '       (do NOT include the project name in the URL)' -ForegroundColor Yellow
+        Write-Host '    2. Team project name is entered separately in the prompt above.' -ForegroundColor Yellow
+        Write-Host '    3. PAT scopes: Code (read) + Pull Request Threads (read & write).' -ForegroundColor Yellow
+        Write-Host '    4. PAT must belong to a user with access to that project.' -ForegroundColor Yellow
+        return
+    }
     try {
-        $reposResult = Invoke-RestMethod `
-            -Uri "${tfsUrl}/${tfsProject}/_apis/git/repositories?api-version=1.0" `
-            -Headers $tfsHeaders `
-            -TimeoutSec 15 `
-            -ErrorAction Stop
-        $allRepos = $reposResult.value | ForEach-Object { $_.name }
+        $reposResult = $jsonBody | ConvertFrom-Json
+        $allRepos    = $reposResult.value | ForEach-Object { $_.name }
         Write-Host "  Connected. Found $($allRepos.Count) repo(s):" -ForegroundColor Green
         $allRepos | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkGray }
     } catch {
-        Write-Host "  ERROR: Could not reach TFS — $_" -ForegroundColor Red
-        Write-Host '  Check TFS_URL, project name, and PAT scopes.' -ForegroundColor Yellow
+        Write-Host "  ERROR: Connected but could not parse repo list — $_" -ForegroundColor Red
+        Write-Host "  Raw response: $jsonBody" -ForegroundColor Red
         return
     }
     Write-Host ''
