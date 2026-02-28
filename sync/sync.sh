@@ -56,8 +56,8 @@ inject_creds() {
         "$rest"
 }
 
-mask() { echo "${1//$TFS_PAT/****}"; mask2 "${1//$GITLAB_TOKEN/####}"; }
-mask2() { echo "$1"; }
+mask()  { mask2 "${1//$TFS_PAT/****}"; }
+mask2() { echo "${1//$GITLAB_TOKEN/####}"; }
 
 # ── TFS REST API ──────────────────────────────────────────────────────────────
 # Usage: tfs_api <method> <path_relative_to_TFS_URL/TFS_PROJECT> [curl-opts...]
@@ -101,7 +101,9 @@ get_tfs_repos() {
 ensure_gl_namespace() {
     local ns="$GITLAB_NAMESPACE"
     local existing
-    existing=$(gl_api GET "/groups/$(url_encode "$ns")" 2>/dev/null | jq -r '.id // empty')
+    # curl -sf returns exit code 22 on 404 (group not yet created); suppress that
+    # with || true so set -e doesn't kill the script before we can create the group.
+    existing=$(gl_api GET "/groups/$(url_encode "$ns")" 2>/dev/null | jq -r '.id // empty') || true
     if [ -n "$existing" ]; then
         echo "$existing"; return
     fi
@@ -141,20 +143,31 @@ sync_git() {
     local project_id="$2"
     local mirror_dir="${WORK_DIR}/${repo_name}.git"
 
-    local tfs_url; tfs_url=$(inject_creds \
-        "${TFS_URL}/${TFS_PROJECT}/_git/${repo_name}" "" "$TFS_PAT")
+    # Plain TFS URL — no embedded credentials.
+    # Auth is passed via http.extraHeader so git sends it on every redirect hop,
+    # matching the --location-trusted behaviour used in tfs_api().
+    local tfs_url="${TFS_URL}/${TFS_PROJECT}/_git/${repo_name}"
+    local tfs_auth; tfs_auth=$(printf ':%s' "$TFS_PAT" | base64 | tr -d '\n')
+
     local gl_host="${GITLAB_URL#*://}"
     local gl_scheme="${GITLAB_URL%%://*}"
     local gl_url="${gl_scheme}://oauth2:${GITLAB_TOKEN}@${gl_host}/${GITLAB_NAMESPACE}/${repo_name}.git"
 
+    # Shorthand: run git with TFS auth header + SSL verification disabled (on-prem TFS)
+    tfs_git() {
+        git -c "http.extraHeader=Authorization: Basic ${tfs_auth}" \
+            -c http.sslVerify=false \
+            "$@"
+    }
+
     if [ ! -d "$mirror_dir" ]; then
         log "[${repo_name}] Initial clone from TFS (this may take a while)..."
-        git clone --mirror "$(mask "$tfs_url")" "$mirror_dir" 2>&1 \
+        tfs_git clone --mirror "$tfs_url" "$mirror_dir" 2>&1 \
             | sed "s|${TFS_PAT}|****|g" \
             || { warn "[${repo_name}] Clone failed"; return 1; }
     else
         log "[${repo_name}] Fetching updates from TFS..."
-        GIT_DIR="$mirror_dir" git fetch --all --prune 2>&1 \
+        tfs_git -C "$mirror_dir" remote update --prune 2>&1 \
             | sed "s|${TFS_PAT}|****|g" \
             || { warn "[${repo_name}] Fetch failed"; return 1; }
     fi

@@ -23,6 +23,7 @@ param(
     [Parameter(ParameterSetName = 'TFSStatus',  Mandatory)][switch]$TFSStatus,
     [Parameter(ParameterSetName = 'TFSSyncNow', Mandatory)][switch]$TFSSyncNow,
     [Parameter(ParameterSetName = 'TFSLogs',    Mandatory)][switch]$TFSLogs,
+    [Parameter(ParameterSetName = 'OpenBrowser', Mandatory)][switch]$OpenBrowser,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
 $ErrorActionPreference = 'Stop'
@@ -623,7 +624,7 @@ function Cmd-TFSSetup {
         Write-Host "  $rawOutput" -ForegroundColor Red
         return
     }
-    $glToken = ($rawOutput | Select-String -Pattern 'TOKEN:([A-Za-z0-9_-]+)').Matches[0].Groups[1].Value
+    $glToken = ($rawOutput | Select-String -Pattern 'TOKEN:([A-Za-z0-9_.=-]+)').Matches[0].Groups[1].Value
     Write-Host "  GitLab token created: $tokenName" -ForegroundColor Green
     Write-Host ''
 
@@ -705,6 +706,17 @@ function Cmd-TFSLogs {
     Invoke-TFSCompose logs -f --tail 50 sync
 }
 
+function Cmd-OpenBrowser {
+    Import-EnvFile
+    $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
+    $url  = "http://localhost:${port}"
+    Write-Host "Opening GitLab at $url ..." -ForegroundColor Cyan
+    $opened = Open-BrowserUrl $url
+    if (-not $opened) {
+        Write-Host "Could not open browser automatically. Navigate to: $url" -ForegroundColor Yellow
+    }
+}
+
 # =============================================================================
 # Interactive menu
 # =============================================================================
@@ -734,6 +746,8 @@ function Show-Menu {
     Write-Host ' 15) TFS Sync Now - Trigger immediate sync'  -ForegroundColor DarkCyan
     Write-Host ' 16) TFS Logs     - Stream sync logs'         -ForegroundColor DarkCyan
     Write-Host ''
+    Write-Host ' 17) Open Browser - Open GitLab in browser'
+    Write-Host ''
     Write-Host '  0) Exit'
     Write-Host ''
 }
@@ -741,7 +755,7 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-16]'
+        $choice = Read-Host '  Choose [0-17]'
         Write-Host ''
         if ($choice -eq '0') {
             Write-Host 'Bye.'
@@ -765,6 +779,7 @@ function Start-InteractiveMenu {
                 '14' { Cmd-TFSStatus }
                 '15' { Cmd-TFSSyncNow }
                 '16' { Cmd-TFSLogs }
+                '17' { Cmd-OpenBrowser }
                 default { Write-Host 'Invalid choice.' }
             }
         } catch {
@@ -796,8 +811,9 @@ switch ($PSCmdlet.ParameterSetName) {
     'TFSStatus'  { Cmd-TFSStatus }
     'TFSSyncNow' { Cmd-TFSSyncNow }
     'TFSLogs'    { Cmd-TFSLogs }
+    'OpenBrowser' { Cmd-OpenBrowser }
     'Help'       {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-TFSSetup|-TFSStatus|-TFSSyncNow|-TFSLogs|-Help]'
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-TFSSetup|-TFSStatus|-TFSSyncNow|-TFSLogs|-OpenBrowser|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }
