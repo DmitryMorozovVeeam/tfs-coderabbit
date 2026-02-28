@@ -22,7 +22,8 @@ param(
     [Parameter(ParameterSetName = 'TFSSetup',   Mandatory)][switch]$TFSSetup,
     [Parameter(ParameterSetName = 'TFSStatus',  Mandatory)][switch]$TFSStatus,
     [Parameter(ParameterSetName = 'TFSSyncNow', Mandatory)][switch]$TFSSyncNow,
-    [Parameter(ParameterSetName = 'TFSLogs',    Mandatory)][switch]$TFSLogs,
+    [Parameter(ParameterSetName = 'TFSLogs',     Mandatory)][switch]$TFSLogs,
+    [Parameter(ParameterSetName = 'TFSProgress', Mandatory)][switch]$TFSProgress,
     [Parameter(ParameterSetName = 'OpenBrowser', Mandatory)][switch]$OpenBrowser,
     [Parameter(ParameterSetName = 'Help',    Mandatory)][switch]$Help
 )
@@ -706,6 +707,93 @@ function Cmd-TFSLogs {
     Invoke-TFSCompose logs -f --tail 50 sync
 }
 
+function Cmd-TFSProgress {
+    Import-EnvFile
+    $port     = Get-EnvOrDefault 'GITLAB_HTTP_PORT'      '8081'
+    $token    = Get-EnvOrDefault 'GITLAB_TFS_TOKEN'       ''
+    $ns       = Get-EnvOrDefault 'GITLAB_TFS_NAMESPACE'   'tfs-mirrors'
+    $tfsRepos = Get-EnvOrDefault 'TFS_REPOS'              ''
+    $apiBase  = "http://localhost:${port}/api/v4"
+
+    if (-not $token) {
+        Write-Host '  GITLAB_TFS_TOKEN not set — run -TFSSetup first.' -ForegroundColor Red
+        return
+    }
+
+    # Build the list of repos to check
+    $repoList = @()
+    if ($tfsRepos) {
+        $repoList = $tfsRepos -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    }
+
+    Write-Host ''
+    Write-Host '=== TFS → GitLab Mirror Progress ===' -ForegroundColor Cyan
+    Write-Host ''
+
+    # Container health
+    $containerStatus = docker ps --filter 'name=gitlab-tfs-sync' --format '{{.Status}}' 2>$null
+    if ($containerStatus) {
+        Write-Host "  Sync container : $containerStatus" -ForegroundColor Green
+    } else {
+        Write-Host '  Sync container : NOT RUNNING' -ForegroundColor Yellow
+    }
+    Write-Host "  Namespace      : http://localhost:${port}/${ns}"
+    Write-Host ''
+
+    # Per-repo status via GitLab API
+    if ($repoList.Count -eq 0) {
+        # Discover all projects in the namespace
+        try {
+            $groupEnc = [Uri]::EscapeDataString($ns)
+            $resp = Invoke-RestMethod -Uri "${apiBase}/groups/${groupEnc}/projects?per_page=50" `
+                -Headers @{ 'PRIVATE-TOKEN' = $token } -ErrorAction Stop
+            $repoList = $resp | ForEach-Object { $_.path }
+        } catch {
+            Write-Host '  Could not query GitLab API — is GitLab running?' -ForegroundColor Yellow
+            $repoList = @()
+        }
+    }
+
+    if ($repoList.Count -eq 0) {
+        Write-Host '  No repos mirrored yet — sync may still be cloning.' -ForegroundColor DarkGray
+    } else {
+        $headers = @{ 'PRIVATE-TOKEN' = $token }
+        foreach ($repo in $repoList) {
+            $enc  = [Uri]::EscapeDataString("${ns}/${repo}")
+            try {
+                $proj = Invoke-RestMethod -Uri "${apiBase}/projects/${enc}" `
+                    -Headers $headers -ErrorAction Stop
+
+                $branches = 0
+                try {
+                    $branchResp = Invoke-RestMethod `
+                        -Uri "${apiBase}/projects/$($proj.id)/repository/branches?per_page=100" `
+                        -Headers $headers -ErrorAction Stop
+                    $branches = @($branchResp).Count
+                } catch {}
+
+                $lastActivity = if ($proj.last_activity_at) {
+                    [datetime]::Parse($proj.last_activity_at).ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+                } else { 'n/a' }
+
+                Write-Host "  [OK] ${repo}" -ForegroundColor Green
+                Write-Host "       Branches : $branches  |  Default : $($proj.default_branch ?? 'n/a')  |  Last activity : $lastActivity" -ForegroundColor DarkGray
+                Write-Host "       URL       : http://localhost:${port}/${ns}/${repo}" -ForegroundColor DarkGray
+            } catch {
+                Write-Host "  [--] ${repo}  (not in GitLab yet — clone in progress or pending)" -ForegroundColor Yellow
+            }
+            Write-Host ''
+        }
+    }
+
+    # Last 15 log lines for live context
+    Write-Host '  Last sync log lines:' -ForegroundColor Cyan
+    Invoke-TFSCompose logs --tail 15 sync 2>&1 | ForEach-Object {
+        Write-Host "  $_" -ForegroundColor DarkGray
+    }
+    Write-Host ''
+}
+
 function Cmd-OpenBrowser {
     Import-EnvFile
     $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
@@ -745,6 +833,7 @@ function Show-Menu {
     Write-Host ' 14) TFS Status   - Show sync container status' -ForegroundColor DarkCyan
     Write-Host ' 15) TFS Sync Now - Trigger immediate sync'  -ForegroundColor DarkCyan
     Write-Host ' 16) TFS Logs     - Stream sync logs'         -ForegroundColor DarkCyan
+    Write-Host ' 18) TFS Progress - Show per-repo mirror status' -ForegroundColor DarkCyan
     Write-Host ''
     Write-Host ' 17) Open Browser - Open GitLab in browser'
     Write-Host ''
@@ -755,7 +844,7 @@ function Show-Menu {
 function Start-InteractiveMenu {
     while ($true) {
         Show-Menu
-        $choice = Read-Host '  Choose [0-17]'
+        $choice = Read-Host '  Choose [0-18]'
         Write-Host ''
         if ($choice -eq '0') {
             Write-Host 'Bye.'
@@ -780,6 +869,7 @@ function Start-InteractiveMenu {
                 '15' { Cmd-TFSSyncNow }
                 '16' { Cmd-TFSLogs }
                 '17' { Cmd-OpenBrowser }
+                '18' { Cmd-TFSProgress }
                 default { Write-Host 'Invalid choice.' }
             }
         } catch {
@@ -810,10 +900,11 @@ switch ($PSCmdlet.ParameterSetName) {
     'TFSSetup'   { Cmd-TFSSetup }
     'TFSStatus'  { Cmd-TFSStatus }
     'TFSSyncNow' { Cmd-TFSSyncNow }
-    'TFSLogs'    { Cmd-TFSLogs }
+    'TFSLogs'     { Cmd-TFSLogs }
+    'TFSProgress' { Cmd-TFSProgress }
     'OpenBrowser' { Cmd-OpenBrowser }
     'Help'       {
-        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-TFSSetup|-TFSStatus|-TFSSyncNow|-TFSLogs|-OpenBrowser|-Help]'
+        Write-Host 'Usage: ./gitlab-tfs.ps1 [-Setup|-Start|-Stop|-Restart|-Logs|-Status|-Backup|-Export|-Import -File <path>|-CodeRabbit|-Tunnel|-Destroy|-TFSSetup|-TFSStatus|-TFSSyncNow|-TFSLogs|-TFSProgress|-OpenBrowser|-Help]'
         Write-Host '       ./gitlab-tfs.ps1   (no args — interactive menu)'
     }
     default   { Start-InteractiveMenu }
