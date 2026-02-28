@@ -156,7 +156,7 @@ function Cmd-Setup {
 
 function Cmd-Start {
     Write-Host 'Starting GitLab (isolated container)...'
-    Invoke-Compose up --detach --build
+    Invoke-Compose up --detach --build --force-recreate
     $port = Get-EnvOrDefault 'GITLAB_HTTP_PORT' '8081'
     $url  = "http://localhost:$port"
     Write-Host ''
@@ -646,7 +646,7 @@ function Cmd-TFSSetup {
     Write-Host '  Building sync image...'
     Invoke-TFSCompose build --no-cache sync
     Write-Host '  Starting sync container (detached)...'
-    Invoke-TFSCompose up --detach sync
+    Invoke-TFSCompose up --detach --force-recreate sync
 
     Write-Host ''
     Write-Host '=== TFS Integration Active ===' -ForegroundColor Green
